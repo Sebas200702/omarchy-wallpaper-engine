@@ -37,6 +37,10 @@ Item {
   property int markedCount: 0
   property string addTarget: ""
   property string newPlaylistName: ""
+  // key of the item whose Delete button is armed (second click within
+  // confirmDeleteTimer's window actually deletes) — a lightweight inline
+  // confirm instead of a modal, so one misclick can't delete a file.
+  property string confirmDeleteKey: ""
 
   readonly property string pluginId: (manifest && manifest.id) || "sebas.wallpaper-engine"
   readonly property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
@@ -188,6 +192,7 @@ Item {
     root.marked = ({})
     root.markedCount = 0
     root.filterText = ""
+    root.confirmDeleteKey = ""
     if (section === "online") {
       if (root.itemsSource !== root.viewSourceTag()) runSearch(true)
     } else {
@@ -242,6 +247,8 @@ Item {
       toggleMark(item.key)
       return
     }
+    if (root.confirmDeleteKey !== "" && root.confirmDeleteKey !== item.key)
+      root.confirmDeleteKey = ""
     root.selectedKey = item.key
     root.selectedItem = item
   }
@@ -303,6 +310,25 @@ Item {
   function removeSelected() {
     if (!root.selectedItem || root.view.section !== "playlist" || root.loading) return
     mutate(["playlist-remove", root.view.name, root.selectedItem.key], "Removed from " + root.view.name, true)
+  }
+
+  // Delete permanently removes the file from disk — arm on first click
+  // (button relabels to "Confirm delete?" for a few seconds), actually
+  // delete on the second. Only offered for on-disk items (never "online"
+  // search results, which aren't files yet).
+  function requestDelete() {
+    if (!root.selectedItem || root.loading || root.view.section === "online") return
+    var key = root.selectedItem.key
+    if (root.confirmDeleteKey === key) {
+      confirmDeleteTimer.stop()
+      root.confirmDeleteKey = ""
+      root.selectedKey = ""
+      root.selectedItem = null
+      mutate(["delete-file", key], "Deleted", true)
+    } else {
+      root.confirmDeleteKey = key
+      confirmDeleteTimer.restart()
+    }
   }
 
   function mutate(args, doneNotice, wantGridReload) {
@@ -453,10 +479,12 @@ Item {
     required property string label
     property bool enabled: true
     property bool primary: false
+    property bool danger: false
     height: 34
     width: Math.max(58, actLabel.implicitWidth + 20)
     radius: Style.cornerRadius
     color: !actBtn.enabled ? Util.alpha(root.onScrim, 0.06)
+      : actBtn.danger ? root.onScrimUrgent
       : actBtn.primary ? root.accent : root.softFill
     opacity: !actBtn.enabled ? 0.5 : 1.0
     signal clicked
@@ -466,10 +494,10 @@ Item {
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: actBtn.label
-      color: actBtn.primary ? root.cardBg : root.onScrim
+      color: (actBtn.primary || actBtn.danger) ? root.cardBg : root.onScrim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
-      font.bold: actBtn.primary
+      font.bold: actBtn.primary || actBtn.danger
     }
     MouseArea {
       anchors.fill: parent
@@ -716,6 +744,13 @@ Item {
       root.busyText = ""
       if (root.errorText === "") root.errorText = "Timed out — check your connection and retry"
     }
+  }
+
+  Timer {
+    id: confirmDeleteTimer
+    interval: 4000
+    repeat: false
+    onTriggered: root.confirmDeleteKey = ""
   }
 
   PanelWindow {
@@ -1500,12 +1535,37 @@ Item {
                     font.pixelSize: Style.font.bodySmall
                   }
 
+                  Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    visible: !!(root.selectedItem && root.selectedItem.attribution)
+                    text: {
+                      var a = root.selectedItem && root.selectedItem.attribution
+                      if (!a) return ""
+                      var src = a.provider === "moewalls" ? "MoeWalls" : a.provider === "wallhaven" ? "Wallhaven" : a.provider
+                      return "From " + src + (a.sourceUrl ? "\n" + a.sourceUrl : "")
+                    }
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
                   ActionButton {
                     label: "Apply wallpaper"
                     primary: true
                     enabled: root.selectedItem !== null && !root.loading
                     Layout.fillWidth: true
                     onClicked: root.applySelected()
+                  }
+
+                  ActionButton {
+                    visible: root.selectedItem !== null && root.view.section !== "online"
+                    label: root.confirmDeleteKey === (root.selectedItem ? root.selectedItem.key : "") ? "Confirm delete?" : "Delete from disk"
+                    danger: root.confirmDeleteKey === (root.selectedItem ? root.selectedItem.key : "")
+                    enabled: !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.requestDelete()
                   }
 
                   Rectangle {
