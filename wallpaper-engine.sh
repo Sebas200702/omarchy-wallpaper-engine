@@ -82,6 +82,20 @@ cfg() {
   [[ -z $val || $val == null ]] && printf '%s' "$def" || printf '%s' "$val"
 }
 
+readonly MIN_VIDEO_BYTES_FLOOR=10485760   # 10 MiB — below this, "max video size" is not a sane setting
+readonly MAX_VIDEO_BYTES_CEILING=4294967296 # 4 GiB — hard ceiling regardless of user config
+
+effective_max_video_bytes() {
+  # honors user config .maxVideoBytes, clamped to a sane range, falling
+  # back to the built-in default when unset/invalid.
+  local v
+  v=$(cfg '.maxVideoBytes' "$MAX_VIDEO_BYTES")
+  [[ $v =~ ^[0-9]+$ ]] || v=$MAX_VIDEO_BYTES
+  (( v < MIN_VIDEO_BYTES_FLOOR )) && v=$MIN_VIDEO_BYTES_FLOOR
+  (( v > MAX_VIDEO_BYTES_CEILING )) && v=$MAX_VIDEO_BYTES_CEILING
+  printf '%s' "$v"
+}
+
 is_video() {
   local ext="${1##*.}"
   ext="${ext,,}"
@@ -147,7 +161,7 @@ validate_wallpaper_path() {
   fi
   local sz
   sz=$(stat -Lc '%s' "$canon" 2>/dev/null) || return 1
-  if (( sz > MAX_VIDEO_BYTES )) && is_video "$canon"; then return 1; fi
+  if (( sz > $(effective_max_video_bytes) )) && is_video "$canon"; then return 1; fi
   return 0
 }
 
@@ -404,7 +418,7 @@ thumbnail_for_video() {
   local media="$1" signature hash thumbnail tmp fsize
   [[ -f "$media" ]] || return 1
   fsize=$(stat -Lc '%s' "$media" 2>/dev/null) || return 1
-  (( fsize > MAX_VIDEO_BYTES || fsize == 0 )) && return 1
+  (( fsize > $(effective_max_video_bytes) || fsize == 0 )) && return 1
   signature=$(stat -Lc '%s:%Y' "$media") || return 1
   hash=$(printf 'ffmpeg-v2:%s:%s' "$media" "$signature" | md5sum); hash="${hash%% *}"
   thumbnail="$cache_dir/$hash.jpg"
@@ -755,7 +769,7 @@ online_apply_stub() {
   mapfile -t _dirs < <(theme_dirs)
   udir="${_dirs[1]}"; online_dir="${_dirs[2]}"
   ensure_secure_dir "$online_dir" || return 1
-  max_bytes=$(cfg '.maxVideoBytes' "$MAX_VIDEO_BYTES")
+  max_bytes=$(effective_max_video_bytes)
   if [[ $provider == wallhaven ]]; then
     ext="${a##*.}"; ext="${ext%%\?*}"; [[ $ext =~ ^(jpg|jpeg|png|webp)$ ]] || ext="jpg"
     fname="wh-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.${ext}"
@@ -795,20 +809,22 @@ online_clear() {
 
 # ---- panel backend (JSON for Panel.qml) ----
 grid_local_json() {
-  local limit="${1:-120}" source="${2:-}" tmp cur list_tmp
+  local limit="${1:-120}" source="${2:-}" tmp cur list_tmp workers
   tmp=$(mktemp) || return 1
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" RETURN
-  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
-  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
+  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
+  workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
   if [[ -n $source && $source != __all__ ]]; then
     list_tmp=$(mktemp) || return 1
     jq -r --arg n "$source" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" 2>/dev/null \
       | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u | head -n "$limit" >"$list_tmp"
-    while IFS= read -r f; do prewarm_media "$f"; done <"$list_tmp" >"$tmp" 2>/dev/null
+    timeout 30 xargs -d '\n' -a "$list_tmp" -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
     rm -f "$list_tmp"
   else
-    build_playlist 2>/dev/null | head -n "$limit" | while IFS= read -r f; do prewarm_media "$f"; done >"$tmp" 2>/dev/null
+    build_playlist 2>/dev/null | head -n "$limit" \
+      | timeout 30 xargs -d '\n' -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
   fi
   cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
   jq -R -s --arg cur "$cur" '
@@ -929,11 +945,9 @@ open_picker_rows() {
   rows_b64=$(base64 -w 0 <"$rows_file")
   local selected=""
   [[ -s $current_state ]] && selected=$(<"$current_state")
-  if ! timeout 30 bash -c 'omarchy-shell image-selector open "" "$1" "$2" "$3" "$4" false false >/dev/null 2>&1 | grep -qx ok' _ "$rows_b64" "$selected" "$selection_file" "$done_file"; then
-    if [[ $(timeout 30 omarchy-shell image-selector open "" "$rows_b64" "$selected" "$selection_file" "$done_file" false false 2>/dev/null) != ok ]]; then
-      return 1
-    fi
-  fi
+  local open_result
+  open_result=$(timeout 30 omarchy-shell image-selector open "" "$rows_b64" "$selected" "$selection_file" "$done_file" false false 2>/dev/null)
+  [[ $open_result == ok ]] || return 1
   local waited=0
   while [[ ! -e $done_file ]]; do
     sleep 0.05; waited=$((waited+1)); (( waited > 6000 )) && return 1
@@ -1000,8 +1014,8 @@ EOF_EXTS
       else
         local workers
         workers=$(nproc); (( workers > 6 )) && workers=6
-        export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
-        export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+        export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
+        export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
         find -L "$tdir" "$udir" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
           | timeout 30 xargs -0 -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ 2>/dev/null \
           | head -n $MAX_ROWS | sort >"$rows_file" || true
@@ -1052,8 +1066,8 @@ EOF_EXTS
   rows_file=$(mktemp)
   # shellcheck disable=SC2064
   trap "rm -f '$rows_file'" RETURN
-  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
-  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
+  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
   find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
     | timeout 30 xargs -0 -r -n 1 -P 4 bash -c 'prewarm_media "$1"' _ 2>/dev/null \
     | head -n $MAX_ROWS | sort >"$rows_file" || true
