@@ -675,6 +675,32 @@ resolve_schedule_pick() {
   return 1
 }
 
+schedules_json() {
+  jq -c '.schedules // []' "$user_config" 2>/dev/null || printf '[]'
+}
+
+schedule_add() {
+  local time="${1:-}" pick="${2:-}"
+  [[ -n $time && -n $pick ]] || { echo "usage: schedule-add <HH:MM> <pick>" >&2; return 1; }
+  [[ $time =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "time must be HH:MM, 00:00-23:59" >&2; return 1; }
+  # must resolve to something right now — otherwise it's a silently-dead
+  # schedule the user has no way of knowing failed until it doesn't fire.
+  resolve_schedule_pick "$pick" >/dev/null || { echo "pick not found in any theme/backgrounds folder: $pick" >&2; return 1; }
+  save_config_filtered '.schedules = ((.schedules // []) + [{time: $t, pick: $p}])' --arg t "$time" --arg p "$pick" || return 1
+  schedules_json
+}
+
+schedule_remove() {
+  local time="${1:-}" pick="${2:-}"
+  [[ -n $time ]] || { echo "usage: schedule-remove <HH:MM> [pick]" >&2; return 1; }
+  if [[ -n $pick ]]; then
+    save_config_filtered '.schedules = ((.schedules // []) | map(select(.time != $t or .pick != $p)))' --arg t "$time" --arg p "$pick" || return 1
+  else
+    save_config_filtered '.schedules = ((.schedules // []) | map(select(.time != $t)))' --arg t "$time" || return 1
+  fi
+  schedules_json
+}
+
 advance_if_due() {
   local enabled paused now last interval sched_time sched_pick sched_epoch
   enabled=$(cfg '.enabled' 'true')
@@ -1425,6 +1451,7 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>
   wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
   wallpaper-engine.sh delete-file <path> | favorite-toggle <path>
+  wallpaper-engine.sh schedules | schedule-add <HH:MM> <pick> | schedule-remove <HH:MM> [pick]
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -1483,6 +1510,9 @@ case "${1:-}" in
   playlist-mode) playlist_set_mode "${2:-}" "${3:-}" ;;
   delete-file) delete_wallpaper_file "${2:-}" ;;
   favorite-toggle) favorite_toggle "${2:-}" ;;
+  schedules) schedules_json ;;
+  schedule-add) schedule_add "${2:-}" "${3:-}" ;;
+  schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;
   grid-search)
     case "${2:-}" in
       wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;
