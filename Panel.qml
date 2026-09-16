@@ -442,7 +442,7 @@ Item {
     property bool enabled: true
     property bool primary: false
     height: 34
-    width: Math.max(70, actLabel.implicitWidth + 28)
+    width: Math.max(58, actLabel.implicitWidth + 20)
     radius: 8
     color: !actBtn.enabled ? Util.alpha(root.onScrim, 0.06)
       : actBtn.primary ? root.accent : root.softFill
@@ -484,8 +484,9 @@ Item {
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
       font.bold: true
-      Layout.preferredWidth: 76
+      Layout.preferredWidth: 62
       horizontalAlignment: Text.AlignHCenter
+      elide: Text.ElideRight
     }
     ActionButton {
       label: "+"
@@ -718,8 +719,13 @@ Item {
 
       Item {
         anchors.centerIn: parent
-        width: Math.min(1180, keyCatcher.width - 48)
-        height: Math.min(700, keyCatcher.height - 48)
+        // Fixed design size, scaled down as a whole on small/scaled screens
+        // (e.g. 1280x720 logical) so the card can never overflow the display.
+        width: 1120
+        height: 680
+        scale: Math.min(1,
+          (keyCatcher.width - 48) / 1120,
+          (keyCatcher.height - 48) / 680)
 
         MouseArea { anchors.fill: parent; onClicked: {} }
 
@@ -736,7 +742,7 @@ Item {
 
             // ============ SIDEBAR ============
             Rectangle {
-              Layout.preferredWidth: 232
+              Layout.preferredWidth: 208
               Layout.fillHeight: true
               color: root.insetFill
               radius: 14
@@ -1217,17 +1223,18 @@ Item {
                 Grid {
                   id: gridFlow
                   width: parent.width
-                  columns: 3
+                  readonly property int cols: width > 560 ? 3 : 2
+                  columns: gridFlow.cols
                   spacing: 12
 
                   Repeater {
                     model: root.filteredItems()
 
                     Item {
-                      required property var modelData
-                      required property int index
-                      width: (gridFlow.width - 2 * gridFlow.spacing) / 3
-                      height: width * 9 / 16 + 32
+                    required property var modelData
+                    required property int index
+                    width: (gridFlow.width - (gridFlow.cols - 1) * gridFlow.spacing) / gridFlow.cols
+                    height: width * 9 / 16 + 32
 
                       Rectangle {
                         anchors.fill: parent
@@ -1398,7 +1405,7 @@ Item {
 
             // ============ PROPERTIES ============
             Rectangle {
-              Layout.preferredWidth: 272
+              Layout.preferredWidth: 248
               Layout.fillHeight: true
               color: root.insetFill
 
@@ -1508,21 +1515,16 @@ Item {
                     font.pixelSize: Style.font.bodySmall
                   }
 
-                  RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 6
-
-                    Text {
-                      textFormat: Text.PlainText
-                      text: "Every"
-                      color: root.onScrimDim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                    }
-                    Stepper {
-                      valueText: root.contextInterval() + " min"
-                      onStepped: function(delta) { root.stepInterval(delta) }
-                    }
+                  Stepper {
+                    valueText: root.contextInterval() + " min"
+                    onStepped: function(delta) { root.stepInterval(delta) }
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "per wallpaper"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
                   }
 
                   RowLayout {
