@@ -43,6 +43,19 @@ Config lives in `~/.config/omarchy/wallpaper-engine.json` (created on first run 
 - `schedules`: `time` is `HH:MM` local 24h, `pick` is a filename present in the theme folders (or an absolute path under allowed roots).
 - Queue state: `~/.local/state/omarchy/wallpaper-engine/queue.json`.
 
+### Battery/idle-aware playback
+
+A video wallpaper only decodes while it can actually be seen:
+
+- `pauseOnBattery` (default `true`): pause while on battery power.
+- `pauseWhenIdle` (default `true`): pause after `idlePauseSeconds` (default
+  `120`) of no keyboard/mouse activity — covers "away from the desk" and
+  "screen locked", since both stop input.
+
+This only pauses/resumes the video player; rotation and the engine's own
+pause (bar widget, `toggle`) are unaffected. Changes to these three keys
+take effect live (no restart needed).
+
 ### CLI
 
 The plugin script is the CLI (symlink it or call by full path):

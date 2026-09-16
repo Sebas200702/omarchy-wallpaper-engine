@@ -9,11 +9,17 @@
   ],
   "maxVideoBytes": 524288000,
   "onlineCacheMaxBytes": 536870912,
+  "pauseOnBattery": true,
+  "pauseWhenIdle": true,
+  "idlePauseSeconds": 120,
   "wallhaven": {
     "categories": "111",
     "purity": "100",
     "sorting": "random",
     "atleast": "1920x1080",
     "ratios": "16x9"
-  }
+  },
+  "playlists": [
+  ],
+  "activePlaylist": null
 }
