@@ -17,12 +17,13 @@
 MOEWALLS_BASE="https://moewalls.com"
 MOEWALLS_DL_BASE="https://go.moewalls.com/download.php?video="
 
-# moewalls_search <query> [per_page] -> TSV: post_id \t title \t page_url
+# moewalls_search <query> [per_page] [page] -> TSV: post_id \t title \t page_url
 moewalls_search() {
-  local query="$1" per_page="${2:-20}" resp
+  local query="$1" per_page="${2:-20}" page="${3:-1}" resp
   [[ -n $query ]] || return 1
+  [[ $page =~ ^[0-9]+$ && $page -ge 1 ]] || page=1
   resp=$(curl -sS --proto '=https' --max-redirs 3 -m 20 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" \
-    "${MOEWALLS_BASE}/wp-json/wp/v2/search?search=$(printf '%s' "$query" | jq -sRr @uri)&per_page=${per_page}&type=post&subtype=post") || return 1
+    "${MOEWALLS_BASE}/wp-json/wp/v2/search?search=$(printf '%s' "$query" | jq -sRr @uri)&per_page=${per_page}&page=${page}&type=post&subtype=post") || return 1
   printf '%s' "$resp" | jq -r '.[]? | [.id, (.title // ""), (.url // "")] | @tsv' || return 1
 }
 

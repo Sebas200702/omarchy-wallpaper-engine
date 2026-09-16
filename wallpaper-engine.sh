@@ -1014,8 +1014,21 @@ grid_local_json() {
 
 grid_search_json() {
   local provider="$1"; shift
+  local page_num=1
+  if [[ ${1:-} == --page=* ]]; then
+    page_num="${1#--page=}"
+    [[ $page_num =~ ^[0-9]+$ && $page_num -ge 1 ]] || page_num=1
+    shift
+  fi
   local query="${*:-anime}"
-  local cap=12 i=0
+  # Wallhaven's API returns a fixed page size (not adjustable via a
+  # per_page-style param) larger than the old cap=12 — capping below a
+  # full provider page here means each "page" would silently discard
+  # some of it, and paging would skip those discarded items forever.
+  # Match cap to a full page for both providers instead (moewalls_search
+  # is given this same value as its own per_page, so it always returns
+  # up to exactly cap items too — nothing left over to skip).
+  local cap=24 i=0
   : >"$online_meta"
   local rows
   rows=$(mktemp) || return 1
@@ -1038,7 +1051,7 @@ grid_search_json() {
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "image" "$page" "$id" "$id" >>"$rows"
       printf '%s\twallhaven\t%s\t%s\t%s\n' "$stub" "$full" "$page" "$id" >>"$online_meta"
-    done < <(wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" 1)
+    done < <(wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" "$page_num")
   elif [[ $provider == moewalls ]]; then
     local id title page_url thumb preview token dtitle slug stub detail
     while IFS=$'\t' read -r id title page_url; do
@@ -1062,7 +1075,7 @@ grid_search_json() {
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" >>"$rows"
       printf '%s\tmoewalls\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" >>"$online_meta"
-    done < <(moewalls_search "$query" "$cap")
+    done < <(moewalls_search "$query" "$cap" "$page_num")
   else
     return 1
   fi
@@ -1515,9 +1528,9 @@ case "${1:-}" in
   schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;
   grid-search)
     case "${2:-}" in
-      wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;
-      moewalls|moe|moewalls.com) shift 2; grid_search_json moewalls "${*:-anime}" ;;
-      *) echo "usage: grid-search wallhaven|moewalls <query>" >&2; exit 1 ;;
+      wallhaven) shift 2; grid_search_json wallhaven "$@" ;;
+      moewalls|moe|moewalls.com) shift 2; grid_search_json moewalls "$@" ;;
+      *) echo "usage: grid-search wallhaven|moewalls [--page=N] <query>" >&2; exit 1 ;;
     esac
     ;;
   apply-key)
