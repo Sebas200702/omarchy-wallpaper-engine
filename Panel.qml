@@ -422,6 +422,60 @@ Item {
     configProc.running = true
   }
 
+  // ---- Wallhaven filters (config-backed, wallpaper-engine.sh validates) ----
+  function wallhavenCfg() {
+    var c = root.engine.config || {}
+    return c.wallhaven || {}
+  }
+
+  function cycleWallhavenSorting() {
+    var order = ["random", "toplist", "date_added", "relevance", "views", "favorites"]
+    var idx = order.indexOf(root.wallhavenCfg().sorting || "random")
+    root.setGlobal("wallhaven.sorting", order[(idx + 1) % order.length])
+  }
+
+  function cycleWallhavenPurity() {
+    var order = ["100", "110", "111"]
+    var idx = order.indexOf(root.wallhavenCfg().purity || "100")
+    if (idx === -1) idx = 0
+    root.setGlobal("wallhaven.purity", order[(idx + 1) % order.length])
+  }
+
+  function cycleWallhavenResolution() {
+    var order = ["", "1920x1080", "2560x1440", "3840x2160"]
+    var idx = order.indexOf(root.wallhavenCfg().atleast || "")
+    if (idx === -1) idx = 0
+    root.setGlobal("wallhaven.atleast", order[(idx + 1) % order.length])
+  }
+
+  function toggleWallhavenCategory(pos) {
+    var cats = root.wallhavenCfg().categories || "111"
+    if (cats.length !== 3) cats = "111"
+    var arr = cats.split("")
+    arr[pos] = arr[pos] === "1" ? "0" : "1"
+    var next = arr.join("")
+    if (next === "000") return // Wallhaven requires at least one category
+    root.setGlobal("wallhaven.categories", next)
+  }
+
+  function wallhavenPurityLabel() {
+    var p = root.wallhavenCfg().purity || "100"
+    if (p === "100") return "Purity: SFW"
+    if (p === "110") return "Purity: SFW+Sketchy"
+    return "Purity: All"
+  }
+
+  function wallhavenSortingLabel() {
+    var s = root.wallhavenCfg().sorting || "random"
+    var names = { date_added: "Newest", relevance: "Relevance", random: "Random", views: "Views", favorites: "Favorites", toplist: "Top" }
+    return "Sort: " + (names[s] || s)
+  }
+
+  function wallhavenResolutionLabel() {
+    var a = root.wallhavenCfg().atleast || ""
+    return a === "" ? "Any resolution" : ("≥ " + a)
+  }
+
   function viewingPlaylist() {
     if (root.view.section !== "playlist") return null
     var pls = root.playlists()
@@ -1234,6 +1288,49 @@ Item {
                     root.itemsSource = ""
                     root.runGrid()
                   }
+                }
+              }
+
+              // Wallhaven filters — config-backed (wallpaper-engine.sh
+              // validates every value), takes effect on the next search.
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: root.view.section === "online" && root.view.provider === "wallhaven"
+
+                ActionButton {
+                  label: root.wallhavenPurityLabel()
+                  enabled: !root.loading
+                  onClicked: root.cycleWallhavenPurity()
+                }
+                ActionButton {
+                  label: root.wallhavenSortingLabel()
+                  enabled: !root.loading
+                  onClicked: root.cycleWallhavenSorting()
+                }
+                ActionButton {
+                  label: root.wallhavenResolutionLabel()
+                  enabled: !root.loading
+                  onClicked: root.cycleWallhavenResolution()
+                }
+                Item { Layout.fillWidth: true }
+                ActionButton {
+                  label: "General"
+                  primary: (root.wallhavenCfg().categories || "111").charAt(0) === "1"
+                  enabled: !root.loading
+                  onClicked: root.toggleWallhavenCategory(0)
+                }
+                ActionButton {
+                  label: "Anime"
+                  primary: (root.wallhavenCfg().categories || "111").charAt(1) === "1"
+                  enabled: !root.loading
+                  onClicked: root.toggleWallhavenCategory(1)
+                }
+                ActionButton {
+                  label: "People"
+                  primary: (root.wallhavenCfg().categories || "111").charAt(2) === "1"
+                  enabled: !root.loading
+                  onClicked: root.toggleWallhavenCategory(2)
                 }
               }
 
