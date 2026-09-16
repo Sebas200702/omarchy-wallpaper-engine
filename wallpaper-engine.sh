@@ -284,6 +284,27 @@ save_config_filtered() {
   fi
 }
 
+# ---- favorites ----
+# A flat list (.favorites in the config) — unlike playlists, no name,
+# interval or mode; just a quick star toggle available from any view.
+favorite_toggle() {
+  local path="${1:-}" canon was_fav
+  [[ -n $path ]] || { echo "usage: favorite-toggle <path>" >&2; return 1; }
+  validate_wallpaper_path "$path" || { echo "invalid or not an allowed wallpaper path: $path" >&2; return 1; }
+  canon=$(readlink -f "$path") || return 1
+  was_fav=$(jq -r --arg f "$canon" '((.favorites // []) | index($f)) != null' "$user_config" 2>/dev/null)
+  if [[ $was_fav == true ]]; then
+    save_config_filtered '.favorites = ((.favorites // []) | map(select(. != $f)))' --arg f "$canon" || return 1
+  else
+    save_config_filtered '.favorites = ((.favorites // []) + [$f] | unique)' --arg f "$canon" || return 1
+  fi
+  jq -n --arg p "$canon" --argjson wasFav "${was_fav:-false}" '{path: $p, favorite: ($wasFav | not)}'
+}
+
+favorites_count() {
+  jq '(.favorites // []) | length' "$user_config" 2>/dev/null || printf '0'
+}
+
 playlists_json() {
   local ap
   ap=$(active_playlist_name)
@@ -357,7 +378,7 @@ delete_wallpaper_file() {
   canon=$(readlink -f "$path") || return 1
   [[ -f $canon ]] || { echo "not found: $canon" >&2; return 1; }
   rm -f -- "$canon" "${canon}.attribution.json" || { echo "could not delete: $canon" >&2; return 1; }
-  save_config_filtered '.playlists[]? |= (.items |= map(select(. != $f)))' --arg f "$canon" || true
+  save_config_filtered '.playlists[]? |= (.items |= map(select(. != $f))) | .favorites = ((.favorites // []) | map(select(. != $f)))' --arg f "$canon" || true
   reset_rotation_state
   if [[ -s $current_state && $(<"$current_state") == "$canon" ]]; then
     do_next >/dev/null 2>&1 || true
@@ -904,7 +925,15 @@ grid_local_json() {
   export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
   export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
   workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
-  if [[ -n $source && $source != __all__ ]]; then
+  if [[ $source == __favorites__ ]]; then
+    list_tmp=$(mktemp) || return 1
+    jq -r '.favorites[]?' "$user_config" 2>/dev/null \
+      | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u >"$list_tmp"
+    total_count=$(wc -l <"$list_tmp")
+    head -n "$limit" "$list_tmp" \
+      | timeout 30 xargs -d '\n' -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
+    rm -f "$list_tmp"
+  elif [[ -n $source && $source != __all__ ]]; then
     list_tmp=$(mktemp) || return 1
     jq -r --arg n "$source" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" 2>/dev/null \
       | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u >"$list_tmp"
@@ -941,8 +970,10 @@ grid_local_json() {
   done <"$tmp" >"$attrs_tmp"
   attrs_json=$(jq -s 'map({(.key): .value}) | add // {}' "$attrs_tmp" 2>/dev/null) || attrs_json='{}'
   rm -f "$attrs_tmp"
+  local favs_json
+  favs_json=$(jq -c '.favorites // []' "$user_config" 2>/dev/null) || favs_json='[]'
   cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
-  jq -R -s --arg cur "$cur" --argjson attrs "$attrs_json" '
+  jq -R -s --arg cur "$cur" --argjson attrs "$attrs_json" --argjson favs "$favs_json" '
     [split("\n")[] | select(length > 0) | split("\t")
      | select(length >= 2)
      | (.[0] | split("/") | last | sub("\\.[^./]+$"; "") | gsub("[-_]+"; " ")) as $t
@@ -951,7 +982,8 @@ grid_local_json() {
         thumb: .[1],
         kind: (if .[0] | test("\\.(mp4|mkv|webm|mov|m4v)$"; "i") then "video" else "image" end),
         current: (.[0] == $cur),
-        attribution: ($attrs[.[0]] // null)}]' "$tmp"
+        attribution: ($attrs[.[0]] // null),
+        favorite: ((.[0] as $k | $favs | index($k)) != null)}]' "$tmp"
 }
 
 grid_search_json() {
@@ -1392,7 +1424,7 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh playlists | playlist-create <n> | playlist-delete <n>
   wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>
   wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
-  wallpaper-engine.sh delete-file <path>
+  wallpaper-engine.sh delete-file <path> | favorite-toggle <path>
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -1450,6 +1482,7 @@ case "${1:-}" in
   playlist-interval) playlist_set_interval "${2:-}" "${3:-}" ;;
   playlist-mode) playlist_set_mode "${2:-}" "${3:-}" ;;
   delete-file) delete_wallpaper_file "${2:-}" ;;
+  favorite-toggle) favorite_toggle "${2:-}" ;;
   grid-search)
     case "${2:-}" in
       wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;
