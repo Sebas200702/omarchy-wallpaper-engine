@@ -26,7 +26,7 @@ readonly rows_signature_state="$state_dir/picker-signature"
 readonly transition_lock="$state_dir/transition.lock"
 readonly rows_lock="$state_dir/picker.lock"
 readonly MAX_VIDEO_BYTES=524288000
-readonly MAX_ROWS=500
+readonly MAX_ROWS=1200
 readonly MAX_ROW_BYTES=2097152
 readonly ONLINE_PER_PAGE=24
 
@@ -185,7 +185,7 @@ build_playlist() {
   for d in "$tdir" "$udir" "$odir"; do
     [[ -L "$d" ]] && continue
     [[ -d "$d" ]] || continue
-    find -L "$d" -maxdepth 2 -type f \( "${args[@]}" \) -print 2>/dev/null
+    find -L "$d" -maxdepth 4 -type f \( "${args[@]}" \) -print 2>/dev/null
   done | sort -u
 }
 
@@ -473,7 +473,7 @@ picker_thumbnail_for_image() {
 
 first_static_background() {
   mapfile -t _dirs < <(theme_dirs)
-  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 2 -type f \
+  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 4 -type f \
     \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
        -o -iname '*.bmp' -o -iname '*.webp' \) -print -quit 2>/dev/null
 }
@@ -593,7 +593,7 @@ resolve_schedule_pick() {
   mapfile -t _dirs < <(theme_dirs)
   for base in "${_dirs[0]}" "${_dirs[1]}" "${_dirs[2]}"; do
     [[ -d "$base" ]] || continue
-    f=$(find -L "$base" -maxdepth 2 -type f -name "$pick" -print -quit 2>/dev/null)
+    f=$(find -L "$base" -maxdepth 4 -type f -name "$pick" -print -quit 2>/dev/null)
     if [[ -n $f ]]; then printf '%s' "$f"; return 0; fi
     [[ -f "$base/$pick" ]] && { printf '%s' "$base/$pick"; return 0; }
   done
@@ -809,7 +809,7 @@ online_clear() {
 
 # ---- panel backend (JSON for Panel.qml) ----
 grid_local_json() {
-  local limit="${1:-120}" source="${2:-}" tmp cur list_tmp workers
+  local limit="${1:-120}" source="${2:-}" tmp cur list_tmp workers total_count
   tmp=$(mktemp) || return 1
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" RETURN
@@ -819,12 +819,24 @@ grid_local_json() {
   if [[ -n $source && $source != __all__ ]]; then
     list_tmp=$(mktemp) || return 1
     jq -r --arg n "$source" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" 2>/dev/null \
-      | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u | head -n "$limit" >"$list_tmp"
-    timeout 30 xargs -d '\n' -a "$list_tmp" -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
+      | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u >"$list_tmp"
+    total_count=$(wc -l <"$list_tmp")
+    head -n "$limit" "$list_tmp" \
+      | timeout 30 xargs -d '\n' -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
     rm -f "$list_tmp"
   else
-    build_playlist 2>/dev/null | head -n "$limit" \
+    list_tmp=$(mktemp) || return 1
+    build_playlist 2>/dev/null >"$list_tmp"
+    total_count=$(wc -l <"$list_tmp")
+    head -n "$limit" "$list_tmp" \
       | timeout 30 xargs -d '\n' -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ >"$tmp" 2>/dev/null
+    rm -f "$list_tmp"
+  fi
+  # surface truncation on stderr (not part of the JSON contract) so the
+  # panel can tell the user "showing 150 of 812" instead of silently
+  # hiding the rest of a large library/playlist.
+  if [[ $total_count =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ ]] && (( total_count > limit )); then
+    printf 'TRUNCATED total=%s shown=%s\n' "$total_count" "$limit" >&2
   fi
   cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
   jq -R -s --arg cur "$cur" '
@@ -992,7 +1004,7 @@ EOF_EXTS
   media_signature=$(
     {
       printf 'engine-v1\0'
-      find -L "$tdir" "$udir" -maxdepth 2 -type f \( "${media_args[@]}" \) -printf '%p:%s:%T@\0' 2>/dev/null | sort -z
+      find -L "$tdir" "$udir" -maxdepth 4 -type f \( "${media_args[@]}" \) -printf '%p:%s:%T@\0' 2>/dev/null | sort -z
     } | md5sum | cut -d ' ' -f 1
   )
   rows_file=$(mktemp)
@@ -1016,7 +1028,7 @@ EOF_EXTS
         workers=$(nproc); (( workers > 6 )) && workers=6
         export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
         export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
-        find -L "$tdir" "$udir" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
+        find -L "$tdir" "$udir" -maxdepth 4 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
           | timeout 30 xargs -0 -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ 2>/dev/null \
           | head -n $MAX_ROWS | sort >"$rows_file" || true
         if [[ -s $rows_file ]]; then
@@ -1068,7 +1080,7 @@ EOF_EXTS
   trap "rm -f '$rows_file'" RETURN
   export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES MIN_VIDEO_BYTES_FLOOR MAX_VIDEO_BYTES_CEILING user_config
   export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir cfg effective_max_video_bytes
-  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
+  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 4 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
     | timeout 30 xargs -0 -r -n 1 -P 4 bash -c 'prewarm_media "$1"' _ 2>/dev/null \
     | head -n $MAX_ROWS | sort >"$rows_file" || true
   [[ -s $rows_file ]] || return 0

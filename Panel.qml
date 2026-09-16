@@ -510,6 +510,7 @@ Item {
     id: gridProc
     property int tag: 0
     property string wantSource: ""
+    property string truncationNote: ""
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -521,10 +522,22 @@ Item {
         if (Array.isArray(arr)) {
           root.parseItems(text, gridProc.wantSource)
           if (arr.length === 0) root.notice = "Empty — add wallpapers to get started"
-          else root.notice = ""
+          else root.notice = gridProc.truncationNote
         } else {
           root.errorText = "Could not list wallpapers"
         }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // engine prints "TRUNCATED total=<n> shown=<m>" on stderr (not part
+        // of the JSON contract) when the library/playlist is bigger than
+        // what got sent to the panel — surface it instead of hiding it.
+        var m = /TRUNCATED total=(\d+) shown=(\d+)/.exec(String(text || ""))
+        gridProc.truncationNote = m ? ("Showing " + m[2] + " of " + m[1] + " — trim the folder or split into playlists") : ""
+        if (gridProc.tag === root.serial && root.opened && gridProc.truncationNote !== "" && root.notice === "")
+          root.notice = gridProc.truncationNote
       }
     }
     onExited: function(code) {
