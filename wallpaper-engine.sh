@@ -609,11 +609,23 @@ advance_if_due() {
   [[ -s $lastchange_state ]] || { printf '%s' "$now" >"$lastchange_state"; return 0; }
   last=$(<"$lastchange_state"); [[ $last =~ ^[0-9]+$ ]] || last=$now
   # 1) schedules win over interval
+  # A schedule slot repeats daily; look at both today's and yesterday's
+  # occurrence and take whichever already happened (closest to now), so a
+  # slot missed while the machine was off/suspended (or one whose time has
+  # since crossed midnight relative to "now") still fires once on resume
+  # instead of being silently skipped until the next calendar day.
+  local sched_epoch_today sched_epoch_yesterday
   while IFS=$'\t' read -r sched_time sched_pick; do
     [[ -n $sched_time && -n $sched_pick ]] || continue
     [[ $sched_time =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || continue
-    sched_epoch=$(date -d "today $sched_time" +%s 2>/dev/null) || continue
-    (( sched_epoch > now )) && continue
+    sched_epoch_today=$(date -d "today $sched_time" +%s 2>/dev/null) || continue
+    if (( sched_epoch_today <= now )); then
+      sched_epoch=$sched_epoch_today
+    else
+      sched_epoch_yesterday=$(date -d "yesterday $sched_time" +%s 2>/dev/null) || continue
+      (( sched_epoch_yesterday <= now )) || continue
+      sched_epoch=$sched_epoch_yesterday
+    fi
     (( last < sched_epoch )) || continue
     local resolved
     if resolved=$(resolve_schedule_pick "$sched_pick"); then
