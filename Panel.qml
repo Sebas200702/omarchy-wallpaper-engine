@@ -37,6 +37,8 @@ Item {
   property int markedCount: 0
   property string addTarget: ""
   property string newPlaylistName: ""
+  property string newScheduleTime: ""
+  property string newSchedulePick: ""
   // key of the item whose Delete button is armed (second click within
   // confirmDeleteTimer's window actually deletes) — a lightweight inline
   // confirm instead of a modal, so one misclick can't delete a file.
@@ -522,6 +524,19 @@ Item {
     if (n === "") { root.errorText = "Name the playlist first"; return }
     root.newPlaylistName = ""
     mutate(["playlist-create", n], "Playlist created: " + n)
+  }
+
+  function createSchedule() {
+    var t = root.newScheduleTime.trim()
+    var p = root.newSchedulePick.trim()
+    if (t === "" || p === "") { root.errorText = "Enter a time (HH:MM) and a filename"; return }
+    root.newScheduleTime = ""
+    root.newSchedulePick = ""
+    mutate(["schedule-add", t, p], "Schedule added: " + t)
+  }
+
+  function removeSchedule(time, pick) {
+    mutate(["schedule-remove", time, pick], "Schedule removed")
   }
 
   function deleteViewingPlaylist() {
@@ -1092,6 +1107,123 @@ Item {
                   ActionButton {
                     label: "+"
                     onClicked: root.createPlaylist()
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "SCHEDULES"
+                  color: root.onScrimFaint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.topMargin: 10
+                }
+
+                Repeater {
+                  model: (root.engine.config && root.engine.config.schedules) || []
+
+                  RowLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.time
+                      color: root.onScrim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.pick
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                      Layout.fillWidth: true
+                    }
+                    ActionButton {
+                      label: "×"
+                      enabled: !root.loading
+                      onClicked: root.removeSchedule(modelData.time, modelData.pick)
+                    }
+                  }
+                }
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: 4
+
+                  Rectangle {
+                    Layout.preferredWidth: 56
+                    height: 30
+                    radius: Style.cornerRadius
+                    color: root.softFill
+
+                    TextInput {
+                      id: newScheduleTimeInput
+                      anchors.fill: parent
+                      anchors.leftMargin: 8
+                      verticalAlignment: TextInput.AlignVCenter
+                      color: root.onScrim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      text: root.newScheduleTime
+                      onTextChanged: root.newScheduleTime = text
+                      Keys.onReturnPressed: root.createSchedule()
+                      Keys.onEnterPressed: root.createSchedule()
+                    }
+                    Text {
+                      visible: newScheduleTimeInput.displayText === ""
+                      anchors.left: parent.left
+                      anchors.leftMargin: 8
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "HH:MM"
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 30
+                    radius: Style.cornerRadius
+                    color: root.softFill
+
+                    TextInput {
+                      id: newSchedulePickInput
+                      anchors.fill: parent
+                      anchors.leftMargin: 8
+                      anchors.rightMargin: 8
+                      verticalAlignment: TextInput.AlignVCenter
+                      color: root.onScrim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      text: root.newSchedulePick
+                      onTextChanged: root.newSchedulePick = text
+                      Keys.onReturnPressed: root.createSchedule()
+                      Keys.onEnterPressed: root.createSchedule()
+                    }
+                    Text {
+                      visible: newSchedulePickInput.displayText === ""
+                      anchors.left: parent.left
+                      anchors.leftMargin: 8
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "filename…"
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  ActionButton {
+                    label: "+"
+                    enabled: !root.loading
+                    onClicked: root.createSchedule()
                   }
                 }
 
