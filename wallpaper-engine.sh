@@ -726,7 +726,7 @@ online_search_wallhaven() {
     slug="wh-$(safe_slug "$query")-$id"
     stub="$cache_dir/online/${slug}.jpg"
     if [[ ! -s $stub ]]; then
-      curl -sSL -m 30 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
+      curl -sSL --proto '=https' --max-redirs 3 -m 30 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
         && mv -f "$stub.tmp" "$stub" || continue
     fi
     printf '%s\t%s\n' "$stub" "$stub" >>"$tmp_rows"
@@ -755,10 +755,10 @@ online_search_moewalls() {
     stub="$cache_dir/online/${slug}.jpg"
     if [[ ! -s $stub ]]; then
       if [[ -n $thumb ]]; then
-        curl -sSL -m 30 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
+        curl -sSL --proto '=https' --max-redirs 3 -m 30 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
       elif [[ -n $preview ]]; then
         # fallback: frame from preview webm
-        curl -sSL -m 30 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
+        curl -sSL --proto '=https' --max-redirs 3 -m 30 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
         timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "$cache_dir/online/${slug}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue
       else
         continue
@@ -887,7 +887,7 @@ grid_search_json() {
       slug="wh-$(safe_slug "$query")-$id"
       stub="$cache_dir/online/${slug}.jpg"
       if [[ ! -s $stub ]]; then
-        curl -sSL -m 25 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
+        curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
           && mv -f "$stub.tmp" "$stub" || continue
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "image" "$page" "$id" "$id" >>"$rows"
@@ -906,9 +906,9 @@ grid_search_json() {
       stub="$cache_dir/online/${slug}.jpg"
       if [[ ! -s $stub ]]; then
         if [[ -n $thumb ]]; then
-          curl -sSL -m 25 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
+          curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
         elif [[ -n $preview ]]; then
-          curl -sSL -m 25 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
+          curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
           timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "$cache_dir/online/${slug}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue
         else
           continue

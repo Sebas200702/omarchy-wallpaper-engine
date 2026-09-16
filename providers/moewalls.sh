@@ -21,7 +21,7 @@ MOEWALLS_DL_BASE="https://go.moewalls.com/download.php?video="
 moewalls_search() {
   local query="$1" per_page="${2:-20}" resp
   [[ -n $query ]] || return 1
-  resp=$(curl -sS -m 20 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" \
+  resp=$(curl -sS --proto '=https' --max-redirs 3 -m 20 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" \
     "${MOEWALLS_BASE}/wp-json/wp/v2/search?search=$(printf '%s' "$query" | jq -sRr @uri)&per_page=${per_page}&type=post&subtype=post") || return 1
   printf '%s' "$resp" | jq -r '.[]? | [.id, (.title // ""), (.url // "")] | @tsv' || return 1
 }
@@ -33,7 +33,7 @@ moewalls_detail() {
     https://moewalls.com/*) ;;
     *) return 1 ;;
   esac
-  html=$(curl -sSL -m 25 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" "$page_url") || return 1
+  html=$(curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" "$page_url") || return 1
   [[ -n $html ]] || return 1
   thumb=$(printf '%s' "$html" | grep -o '<meta property="og:image" content="[^"]*"' | head -n1 | sed 's/.*content="//;s/"$//')
   preview=$(printf '%s' "$html" | grep -o '<source src="[^"]*preview[^"]*\.webm"' | head -n1 | sed 's/.*src="//;s/"$//')
@@ -65,7 +65,7 @@ moewalls_download() {
   # parsing.
   [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .moe.XXXXXX) || return 1
-  if ! curl -sSL -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
+  if ! curl -sSL --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
       -o "$tmp" "$(moewalls_download_url "$token")"; then
     rm -f "$tmp"; return 1
   fi
@@ -90,5 +90,5 @@ moewalls_preview() {
     https://moewalls.com/*) ;;
     *) return 1 ;;
   esac
-  curl -sSL -m 60 -A "Mozilla/5.0 (X11; Linux x86_64)" -o "$dest" "$preview_url"
+  curl -sSL --proto '=https' --max-redirs 3 -m 60 -A "Mozilla/5.0 (X11; Linux x86_64)" -o "$dest" "$preview_url"
 }

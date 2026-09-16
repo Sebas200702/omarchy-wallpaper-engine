@@ -15,7 +15,7 @@ wallhaven_search() {
   [[ -n $ratios ]] && url+="&ratios=${ratios}"
   url+="&page=${page}"
 
-  resp=$(curl -sS -m 20 -A "omarchy-wallpaper-engine/0.1" "$url") || return 1
+  resp=$(curl -sS --proto '=https' --max-redirs 3 -m 20 -A "omarchy-wallpaper-engine/0.1" "$url") || return 1
   printf '%s' "$resp" | jq -r '.data[]? | [.id, (.url // ""), (.path // ""), (.thumbs.large // .thumbs.small // "")] | @tsv' || return 1
 }
 
@@ -26,7 +26,7 @@ wallhaven_download() {
   local tmp ctype size
   [[ $full_url == https://w.wallhaven.cc/* ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .wh.XXXXXX) || return 1
-  if ! curl -sSL -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
+  if ! curl -sSL --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
     rm -f "$tmp"; return 1
   fi
   ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
