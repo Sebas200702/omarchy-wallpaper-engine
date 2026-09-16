@@ -45,7 +45,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: ""
+    text: "\uf03e" // Nerd Font image icon U+F03E (ascii escape)
+    // U+F03E image icon (explicit glyph; Nerd Font in bar font stack)
     slotSize: Style.bar.statusSlot
     active: root.paused
     tooltipText: root.tooltip()
