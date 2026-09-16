@@ -495,6 +495,13 @@ apply_file() {
   local file="$1" transition_ms="${2:-}" poster prev
   [[ -z $transition_ms ]] && transition_ms=$(cfg '.transitionMs' '420')
   validate_wallpaper_path "$file" || return 1
+  # canonicalize once we know $file is a valid, allowed path — everything
+  # downstream (state files, `omarchy theme bg set`) stores/compares this
+  # exact string, and stop_if_changed compares it against a readlink -f
+  # of the live background symlink; keeping both sides canonical avoids
+  # a spurious "manual change" detection when a background file is
+  # itself reached through a symlink.
+  file=$(readlink -f "$file") || return 1
   [[ -s $current_state ]] && prev=$(<"$current_state") || prev=""
   [[ -n $prev && $prev != "$file" ]] && push_history "$prev"
   if is_video "$file"; then
@@ -664,6 +671,7 @@ do_prev() {
   local file="$prev" transition_ms
   transition_ms=$(cfg '.transitionMs' '420')
   validate_wallpaper_path "$file" || return 1
+  file=$(readlink -f "$file") || return 1
   if is_video "$file"; then
     local poster
     poster=$(thumbnail_for_video "$file") || return 1
