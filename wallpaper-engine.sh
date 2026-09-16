@@ -1033,6 +1033,38 @@ config_set_key() {
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle)
+      [[ $val == true || $val == false ]] || { echo "$key must be true|false" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson b "$val" --arg k "$key" '.[$k] = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    transitionMs)
+      [[ $val =~ ^[0-9]+$ && $val -le 4000 ]] || { echo "transitionMs must be 0-4000" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" '.transitionMs = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    idlePauseSeconds)
+      [[ $val =~ ^[0-9]+$ && $val -ge 10 && $val -le 3600 ]] || { echo "idlePauseSeconds must be 10-3600" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" '.idlePauseSeconds = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    maxVideoBytes|onlineCacheMaxBytes)
+      [[ $val =~ ^[0-9]+$ && $val -ge 1048576 ]] || { echo "$key must be a byte count >= 1MiB" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" --arg k "$key" '.[$k] = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    wallhaven.categories|wallhaven.purity)
+      [[ $val =~ ^[01]{3}$ ]] || { echo "$key must be 3 digits of 0/1 (e.g. 111)" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" --arg k "${key#wallhaven.}" '.wallhaven[$k] = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    wallhaven.sorting)
+      case "$val" in
+        date_added|relevance|random|views|favorites|toplist) ;;
+        *) echo "wallhaven.sorting must be one of date_added|relevance|random|views|favorites|toplist" >&2; rm -f "$tmp"; return 1 ;;
+      esac
+      jq --arg v "$val" '.wallhaven.sorting = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    wallhaven.atleast)
+      [[ -z $val || $val =~ ^[0-9]{2,5}x[0-9]{2,5}$ ]] || { echo "wallhaven.atleast must be WIDTHxHEIGHT (e.g. 1920x1080) or empty" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" '.wallhaven.atleast = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    wallhaven.ratios)
+      if [[ -n $val ]]; then
+        local seg ok=1
+        IFS=',' read -ra _ratio_segs <<<"$val"
+        for seg in "${_ratio_segs[@]}"; do [[ $seg =~ ^[0-9]{1,2}x[0-9]{1,2}$ ]] || ok=0; done
+        (( ok )) || { echo "wallhaven.ratios must be comma-separated WxH (e.g. 16x9,16x10) or empty" >&2; rm -f "$tmp"; return 1; }
+      fi
+      jq --arg v "$val" '.wallhaven.ratios = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     *) echo "unknown key: $key" >&2; rm -f "$tmp"; return 1 ;;
   esac
   mv -f "$tmp" "$user_config"
