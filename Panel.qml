@@ -74,6 +74,7 @@ Item {
 
   function viewTitle() {
     if (root.view.section === "playlist") return root.view.name
+    if (root.view.section === "favorites") return "Favorites"
     if (root.view.section === "online")
       return root.view.provider === "moewalls" ? "Live — MoeWalls" : "Wallhaven"
     return "Library"
@@ -81,6 +82,7 @@ Item {
 
   function viewSourceTag() {
     if (root.view.section === "playlist") return "playlist:" + root.view.name
+    if (root.view.section === "favorites") return "favorites"
     if (root.view.section === "online") return "online:" + root.view.provider + ":" + root.query
     return "lib"
   }
@@ -212,8 +214,10 @@ Item {
 
   function runGrid() {
     var s = root.startBusy(root.view.section === "playlist"
-      ? "Loading playlist…" : "Loading library…")
-    var src = root.view.section === "playlist" ? root.view.name : ""
+      ? "Loading playlist…" : root.view.section === "favorites"
+      ? "Loading favorites…" : "Loading library…")
+    var src = root.view.section === "playlist" ? root.view.name
+      : root.view.section === "favorites" ? "__favorites__" : ""
     gridProc.command = [root.script, "grid-local", "150", src]
     gridProc.tag = s
     gridProc.wantSource = root.viewSourceTag()
@@ -382,6 +386,11 @@ Item {
       root.confirmDeleteKey = key
       confirmDeleteTimer.restart()
     }
+  }
+
+  function toggleFavorite(item) {
+    if (!item || root.loading || root.view.section === "online") return
+    mutate(["favorite-toggle", item.key], "", true)
   }
 
   function mutate(args, doneNotice, wantGridReload) {
@@ -949,7 +958,10 @@ Item {
                 }
 
                 Repeater {
-                  model: [{ label: "All wallpapers", section: "lib", name: "", count: -1 }]
+                  model: [
+                    { label: "All wallpapers", section: "lib", name: "", count: -1 },
+                    { label: "★ Favorites", section: "favorites", name: "", count: -1 }
+                  ]
 
                   Rectangle {
                     required property var modelData
@@ -1468,6 +1480,7 @@ Item {
                         }
 
                         Rectangle {
+                          id: liveBadge
                           visible: modelData.kind === "video"
                           anchors.top: parent.top
                           anchors.right: parent.right
@@ -1486,6 +1499,37 @@ Item {
                             font.family: root.fontFamily
                             font.pixelSize: 10
                             font.bold: true
+                          }
+                        }
+
+                        Rectangle {
+                          visible: root.view.section !== "online"
+                          anchors.top: parent.top
+                          anchors.right: liveBadge.visible ? liveBadge.left : parent.right
+                          anchors.topMargin: 6
+                          anchors.rightMargin: 6
+                          width: 22
+                          height: 22
+                          radius: Style.cornerRadius
+                          color: Qt.rgba(0, 0, 0, 0.65)
+
+                          Text {
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: modelData.favorite ? "★" : "☆"
+                            color: modelData.favorite ? "#ffd54a" : "white"
+                            font.family: root.fontFamily
+                            font.pixelSize: 13
+                            font.bold: true
+                          }
+
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: function(mouse) {
+                              mouse.accepted = true
+                              root.toggleFavorite(modelData)
+                            }
                           }
                         }
 
@@ -1583,6 +1627,8 @@ Item {
                   ? "Search to browse. Results download on Apply."
                   : (root.view.section === "playlist"
                     ? "Empty playlist — use Select in Library to add some."
+                    : root.view.section === "favorites"
+                    ? "No favorites yet — click the star on a wallpaper to add it here."
                     : "No wallpapers here yet.")
                 color: root.onScrimFaint
                 font.family: root.fontFamily
@@ -1713,6 +1759,15 @@ Item {
                     enabled: root.selectedItem !== null && !root.loading
                     Layout.fillWidth: true
                     onClicked: root.applySelected()
+                  }
+
+                  ActionButton {
+                    visible: root.selectedItem !== null && root.view.section !== "online"
+                    label: (root.selectedItem && root.selectedItem.favorite) ? "★ Unfavorite" : "☆ Favorite"
+                    primary: !!(root.selectedItem && root.selectedItem.favorite)
+                    enabled: !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.toggleFavorite(root.selectedItem)
                   }
 
                   ActionButton {
