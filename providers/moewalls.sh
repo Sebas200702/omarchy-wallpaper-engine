@@ -41,19 +41,29 @@ moewalls_detail() {
   title=$(printf '%s' "$html" | grep -o '<meta property="og:title" content="[^"]*"' | head -n1 | sed 's/.*content="//;s/"$//')
   # relativize preview
   if [[ $preview == /* ]]; then preview="${MOEWALLS_BASE}${preview}"; fi
-  [[ -n $token ]] || return 1
+  # the token comes straight out of third-party HTML (data-url="...") and
+  # gets interpolated into a download URL below — constrain it to a plain
+  # opaque-identifier charset before it ever leaves this function, so a
+  # malformed/hostile page can't inject query params, path segments, or
+  # other URL structure into moewalls_download_url.
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
   printf '%s\t%s\t%s\t%s\n' "${thumb:-}" "${preview:-}" "$token" "${title:-}"
 }
 
 moewalls_download_url() {
-  printf '%s%s' "$MOEWALLS_DL_BASE" "$1"
+  local token="$1" encoded
+  encoded=$(printf '%s' "$token" | jq -sRr @uri) || return 1
+  printf '%s%s' "$MOEWALLS_DL_BASE" "$encoded"
 }
 
 # moewalls_download <token> <dest> <max_bytes> — full mp4 via go.moewalls.com
 moewalls_download() {
   local token="$1" dest="$2" max_bytes="${3:-524288000}"
   local tmp ctype size
-  [[ -n $token ]] || return 1
+  # re-validate at the trust boundary: this function is also reachable
+  # directly, and the token may have crossed a state file since detail
+  # parsing.
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .moe.XXXXXX) || return 1
   if ! curl -sSL -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
       -o "$tmp" "$(moewalls_download_url "$token")"; then

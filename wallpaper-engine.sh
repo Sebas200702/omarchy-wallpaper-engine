@@ -776,7 +776,11 @@ online_apply_stub() {
   # online_apply_stub <stub-path> — downloads full file to online dir + applies
   local stub="$1" line provider a b c max_bytes udir online_dir fname dest ext
   [[ -f $online_meta ]] || return 1
-  line=$(grep -F -m1 "$stub"$'\t' "$online_meta") || return 1
+  # exact match on field 1 only — grep -F "$stub"$'\t' would also match if
+  # $stub ever occurred as a substring later in the line (e.g. inside a
+  # title), not just as the key.
+  line=$(awk -F '\t' -v key="$stub" '$1 == key { print; exit }' "$online_meta")
+  [[ -n $line ]] || return 1
   IFS=$'\t' read -r _stub provider a b c <<<"$line"
   mapfile -t _dirs < <(theme_dirs)
   udir="${_dirs[1]}"; online_dir="${_dirs[2]}"
