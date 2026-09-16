@@ -814,7 +814,9 @@ grid_local_json() {
   jq -R -s --arg cur "$cur" '
     [split("\n")[] | select(length > 0) | split("\t")
      | select(length >= 2)
-     | {key: .[0], title: (.[0] | split("/") | last | sub("\\.[^./]+$"; "") | gsub("[-_]+"; " ")),
+     | (.[0] | split("/") | last | sub("\\.[^./]+$"; "") | gsub("[-_]+"; " ")) as $t
+     | (if $t | test("^(moe|wh) ") then ($t | sub("^(moe|wh) +"; "") | sub("( [0-9]+)+$"; "") | sub(" moewalls$"; "") | sub(" live wallpaper$"; "")) else $t end) as $h
+     | {key: .[0], title: $h,
         thumb: .[1],
         kind: (if .[0] | test("\\.(mp4|mkv|webm|mov|m4v)$"; "i") then "video" else "image" end),
         current: (.[0] == $cur)}]' "$tmp"
@@ -877,7 +879,9 @@ grid_search_json() {
   jq -R -s '
     [split("\n")[] | select(length > 0) | split("\t")
      | select(length >= 5)
-     | {key: .[0], kind: .[1], page: .[2], title: .[3], thumb: .[0]}]' "$rows"
+     | {key: .[0], kind: .[1], page: .[2],
+        title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
+        thumb: .[0]}]' "$rows"
 }
 
 config_get_json() {

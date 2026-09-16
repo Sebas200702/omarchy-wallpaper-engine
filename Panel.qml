@@ -40,13 +40,22 @@ Item {
 
   readonly property string pluginId: (manifest && manifest.id) || "sebas.wallpaper-engine"
   readonly property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
-  readonly property color onScrim: "white"
-  readonly property color onScrimDim: Qt.rgba(1, 1, 1, 0.6)
-  readonly property color onScrimFaint: Qt.rgba(1, 1, 1, 0.32)
-  readonly property color onScrimUrgent: "#ff7b72"
-  readonly property color accent: "#7aa2f7"
-  readonly property color cardBg: Qt.rgba(0.09, 0.09, 0.11, 0.97)
-  readonly property color rowHover: Qt.rgba(1, 1, 1, 0.07)
+  // Theme-faithful palette: popup/menu roles follow the active Omarchy
+  // theme (catppuccin-dark right now), with translucent text steps derived
+  // from the themed text color instead of hardcoded white.
+  readonly property color onScrim: Color.popups.text
+  readonly property color onScrimDim: Util.alpha(Color.popups.text, 0.62)
+  readonly property color onScrimFaint: Util.alpha(Color.popups.text, 0.38)
+  readonly property color onScrimUrgent: Color.urgent
+  readonly property color accent: Color.accent
+  readonly property color markedColor: Color.accent
+  readonly property color cardBg: Color.popups.background
+  readonly property color cardBorder: Color.popups.border
+  readonly property color rowHover: Color.menu.selectedBackground
+  readonly property color rowHoverText: Color.menu.selectedText
+  readonly property color scrimColor: Color.menu.scrim
+  readonly property color softFill: Util.alpha(Color.popups.text, 0.08)
+  readonly property color insetFill: Util.alpha(Color.popups.text, 0.045)
   readonly property string fontFamily: Style.font.family
 
   function playlists() {
@@ -435,8 +444,8 @@ Item {
     height: 34
     width: Math.max(70, actLabel.implicitWidth + 28)
     radius: 8
-    color: !actBtn.enabled ? Qt.rgba(1, 1, 1, 0.06)
-      : actBtn.primary ? root.accent : Qt.rgba(1, 1, 1, 0.12)
+    color: !actBtn.enabled ? Util.alpha(root.onScrim, 0.06)
+      : actBtn.primary ? root.accent : root.softFill
     opacity: !actBtn.enabled ? 0.5 : 1.0
     signal clicked
 
@@ -445,7 +454,7 @@ Item {
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: actBtn.label
-      color: actBtn.primary ? "#0b0d12" : root.onScrim
+      color: actBtn.primary ? root.cardBg : root.onScrim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
       font.bold: actBtn.primary
@@ -694,7 +703,7 @@ Item {
 
     Rectangle {
       anchors.fill: parent
-      color: Qt.rgba(0, 0, 0, 0.72)
+      color: root.scrimColor
       MouseArea {
         anchors.fill: parent
         onClicked: root.dismiss()
@@ -719,7 +728,7 @@ Item {
           radius: 14
           color: root.cardBg
           border.width: 1
-          border.color: Qt.rgba(1, 1, 1, 0.12)
+          border.color: root.cardBorder
 
           RowLayout {
             anchors.fill: parent
@@ -729,7 +738,7 @@ Item {
             Rectangle {
               Layout.preferredWidth: 232
               Layout.fillHeight: true
-              color: Qt.rgba(0, 0, 0, 0.25)
+              color: root.insetFill
               radius: 14
 
               Rectangle {
@@ -775,7 +784,7 @@ Item {
                     height: 36
                     radius: 8
                     color: root.view.section === modelData.section && root.view.name === ""
-                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                      ? root.rowHover : "transparent"
                     border.width: root.view.section === modelData.section && root.view.name === "" ? 1 : 0
                     border.color: root.accent
 
@@ -822,7 +831,7 @@ Item {
                     height: 40
                     radius: 8
                     color: root.view.section === "playlist" && root.view.name === modelData.name
-                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                      ? root.rowHover : "transparent"
                     border.width: root.view.section === "playlist" && root.view.name === modelData.name ? 1 : 0
                     border.color: root.accent
 
@@ -867,7 +876,7 @@ Item {
                     Layout.fillWidth: true
                     height: 34
                     radius: 8
-                    color: Qt.rgba(1, 1, 1, 0.08)
+                    color: root.softFill
 
                     TextInput {
                       id: newPlaylistInput
@@ -923,7 +932,7 @@ Item {
                     height: 36
                     radius: 8
                     color: root.view.section === "online" && root.view.provider === modelData.provider
-                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                      ? root.rowHover : "transparent"
                     border.width: root.view.section === "online" && root.view.provider === modelData.provider ? 1 : 0
                     border.color: root.accent
 
@@ -1047,7 +1056,7 @@ Item {
                   Layout.fillWidth: true
                   height: 38
                   radius: 8
-                  color: Qt.rgba(1, 1, 1, 0.08)
+                  color: root.softFill
                   border.width: centerInput.activeFocus ? 1 : 0
                   border.color: root.accent
 
@@ -1146,7 +1155,7 @@ Item {
                   Layout.fillWidth: true
                   height: 6
                   radius: 3
-                  color: Qt.rgba(1, 1, 1, 0.1)
+                  color: root.softFill
 
                   Rectangle {
                     id: progressSlide
@@ -1224,9 +1233,9 @@ Item {
                         anchors.fill: parent
                         radius: 8
                         color: root.selectedKey === modelData.key
-                          ? Qt.rgba(122, 162, 247, 0.22) : Qt.rgba(1, 1, 1, 0.05)
+                          ? Util.alpha(root.accent, 0.22) : root.softFill
                         border.width: (root.selectedKey === modelData.key || modelData.current || root.marked[modelData.key]) ? 2 : 0
-                        border.color: root.marked[modelData.key] ? "#98c379" : root.accent
+                        border.color: root.marked[modelData.key] ? root.markedColor : root.accent
 
                         Image {
                           anchors.top: parent.top
@@ -1270,13 +1279,13 @@ Item {
                           width: 22
                           height: 22
                           radius: 11
-                          color: "#98c379"
+                          color: root.markedColor
 
                           Text {
                             anchors.centerIn: parent
                             textFormat: Text.PlainText
                             text: "✓"
-                            color: "#0b0d12"
+                            color: root.cardBg
                             font.family: root.fontFamily
                             font.pixelSize: 13
                             font.bold: true
@@ -1391,7 +1400,7 @@ Item {
             Rectangle {
               Layout.preferredWidth: 272
               Layout.fillHeight: true
-              color: Qt.rgba(0, 0, 0, 0.25)
+              color: root.insetFill
 
               Flickable {
                 anchors.fill: parent
@@ -1418,7 +1427,7 @@ Item {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 150
                     radius: 8
-                    color: Qt.rgba(1, 1, 1, 0.05)
+                    color: root.softFill
 
                     Image {
                       anchors.fill: parent
@@ -1443,7 +1452,8 @@ Item {
                     Layout.fillWidth: true
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
-                    text: root.selectedItem ? (root.selectedItem.title || "") : "—"
+                    text: root.selectedItem ? (root.selectedItem.title || "") : ""
+                    visible: root.selectedItem !== null
                     color: root.onScrim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -1456,7 +1466,7 @@ Item {
                     text: root.selectedItem
                       ? ((root.selectedItem.kind === "video" ? "Live video" : "Image")
                         + (root.view.section === "online" ? " • remote — downloads on Apply" : " • local"))
-                      : ""
+                      : "Click a wallpaper to preview it here.\nDouble-click (or Apply) to set it."
                     color: root.onScrimFaint
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -1473,7 +1483,7 @@ Item {
                   Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: Qt.rgba(1, 1, 1, 0.1)
+                    color: root.softFill
                   }
 
                   Text {
@@ -1556,7 +1566,7 @@ Item {
                   Rectangle {
                     Layout.fillWidth: true
                     height: 1
-                    color: Qt.rgba(1, 1, 1, 0.1)
+                    color: root.softFill
                   }
 
                   Text {
