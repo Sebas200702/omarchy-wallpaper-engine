@@ -21,6 +21,8 @@ Item {
   property string itemsSource: "" // lib | playlist:<name> | online:<provider>:<query>
   property string query: ""
   property string filterText: ""
+  property int searchPage: 1
+  property bool searchHasMore: true
   property bool loading: false
   property string busyText: ""
   property int busySince: 0
@@ -232,11 +234,29 @@ Item {
       q = root.view.provider === "moewalls" ? "anime" : "landscape"
     if (q === "") { root.errorText = "Type something to search"; return }
     root.query = q
+    root.searchPage = 1
+    root.searchHasMore = true
     var s = root.startBusy("Searching " + root.view.provider + "…")
     root.notice = ""
     searchProc.command = [root.script, "grid-search", root.view.provider, q]
     searchProc.tag = s
     searchProc.wantSource = "online:" + root.view.provider + ":" + q
+    searchProc.append = false
+    searchProc.running = true
+  }
+
+  function loadMoreSearch() {
+    if (root.loading || root.view.section !== "online" || !root.searchHasMore) return
+    var q = root.query.trim()
+    if (q === "") return
+    var nextPage = root.searchPage + 1
+    var s = root.startBusy("Loading more…")
+    root.notice = ""
+    searchProc.command = [root.script, "grid-search", root.view.provider, "--page=" + nextPage, q]
+    searchProc.tag = s
+    searchProc.wantSource = "online:" + root.view.provider + ":" + q
+    searchProc.append = true
+    searchProc.pendingPage = nextPage
     searchProc.running = true
   }
 
@@ -715,6 +735,8 @@ Item {
     id: searchProc
     property int tag: 0
     property string wantSource: ""
+    property bool append: false
+    property int pendingPage: 1
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -724,13 +746,35 @@ Item {
         var arr = null
         try { arr = JSON.parse(String(text || "")) } catch (e) { arr = null }
         if (Array.isArray(arr) && arr.length > 0) {
-          root.parseItems(text, searchProc.wantSource)
-          root.notice = arr.length + " results — select one, then Apply"
+          if (searchProc.append && root.itemsSource === searchProc.wantSource) {
+            var seen = {}
+            var i
+            for (i = 0; i < root.items.length; i++) seen[root.items[i].key] = true
+            var merged = root.items.slice()
+            var added = 0
+            for (i = 0; i < arr.length; i++) {
+              if (!seen[arr[i].key]) { merged.push(arr[i]); added++ }
+            }
+            root.items = merged
+            root.searchPage = searchProc.pendingPage
+            if (added === 0) root.searchHasMore = false
+            root.notice = merged.length + " results — select one, then Apply"
+          } else {
+            root.parseItems(text, searchProc.wantSource)
+            root.searchPage = 1
+            root.searchHasMore = true
+            root.notice = arr.length + " results — select one, then Apply"
+          }
         } else if (Array.isArray(arr)) {
-          root.items = []
-          root.itemsSource = searchProc.wantSource
-          root.notice = ""
-          root.errorText = "No results. Try another search."
+          if (searchProc.append) {
+            root.searchHasMore = false
+            root.notice = root.items.length + " results — no more"
+          } else {
+            root.items = []
+            root.itemsSource = searchProc.wantSource
+            root.notice = ""
+            root.errorText = "No results. Try another search."
+          }
         } else {
           root.errorText = "Search failed — connection issue or provider changed"
         }
@@ -1746,6 +1790,14 @@ Item {
                     }
                   }
                 }
+              }
+
+              ActionButton {
+                visible: root.view.section === "online" && root.items.length > 0 && root.searchHasMore
+                label: "Load more"
+                enabled: !root.loading
+                Layout.alignment: Qt.AlignHCenter
+                onClicked: root.loadMoreSearch()
               }
 
               Text {
