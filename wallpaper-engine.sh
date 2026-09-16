@@ -77,9 +77,16 @@ ensure_config
 
 cfg() {
   # cfg <jq-filter> <default>
+  # Uses an explicit null-check rather than jq's `//` alternative operator:
+  # `//` treats `false` as falsy too (0 and "" are not), so
+  # "$filter // empty" would silently fall back to the default for a
+  # boolean config key the user explicitly set to false (e.g.
+  # .enabled:false, .includeVideos:false) — exactly the values callers
+  # most need to read back correctly. Only a genuinely missing/null value
+  # should use the default.
   local filter="$1" def="${2:-}" val
-  val=$(jq -r "$filter // empty" "$user_config" 2>/dev/null) || val=""
-  [[ -z $val || $val == null ]] && printf '%s' "$def" || printf '%s' "$val"
+  val=$(jq -r --arg d "$def" "(${filter}) as \$v | if \$v == null then \$d else \$v end" "$user_config" 2>/dev/null) || val=""
+  [[ -z $val ]] && printf '%s' "$def" || printf '%s' "$val"
 }
 
 readonly MIN_VIDEO_BYTES_FLOOR=10485760   # 10 MiB — below this, "max video size" is not a sane setting

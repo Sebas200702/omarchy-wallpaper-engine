@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Services.UPower
 import QtQuick
 import QtMultimedia
 import qs.Commons
@@ -26,6 +27,30 @@ Item {
   readonly property string allowedSystemPrefix: "/usr/share/omarchy/"
   readonly property string allowedLocalSharePrefix: home + "/.local/share/omarchy/"
   readonly property string allowedCachePrefix: home + "/.cache/omarchy/wallpaper-engine/online/"
+
+  // ---- battery/idle-aware playback pause ----
+  // A video wallpaper otherwise decodes 24/7 regardless of whether anyone
+  // can see it (locked screen, user away, on battery). This block pauses
+  // the MediaPlayer — not the engine/rotation — when either condition is
+  // active, and resumes it the moment the condition clears. Config comes
+  // from the same wallpaper-engine.json bash reads, kept in sync via a
+  // FileView watch, so this stays a "thin player" concern: bash still
+  // owns what to show, this only decides whether to keep decoding it.
+  readonly property string userConfigPath: home + "/.config/omarchy/wallpaper-engine.json"
+  property bool pauseOnBatteryCfg: true
+  property bool pauseWhenIdleCfg: true
+  property int idlePauseSecondsCfg: 120
+  property bool systemPaused: false
+
+  function recomputeSystemPause() {
+    var shouldPause = (root.pauseOnBatteryCfg && UPower.onBattery)
+      || (root.pauseWhenIdleCfg && idleMonitor.isIdle)
+    if (shouldPause !== root.systemPaused) root.systemPaused = shouldPause
+  }
+
+  function reloadPauseConfig() {
+    if (!pauseConfigProc.running) pauseConfigProc.running = true
+  }
 
   function isValidVideoPath(p) {
     if (!p) return false
@@ -229,7 +254,14 @@ Item {
   }
 
   Timer {
-    interval: 3000
+    // Detects a manual wallpaper change made outside the engine (theme
+    // switcher, double-click picker, etc.) so rotation adopts it instead
+    // of fighting it. 3s was needlessly tight for something that only
+    // needs to feel responsive, not instant — spawning a bash process
+    // ~28,800 times/day for a condition that changes a handful of times
+    // a week. 12s is still well under a human's "did that just change?"
+    // threshold.
+    interval: 12000
     repeat: true
     running: true
     onTriggered: {
@@ -243,6 +275,53 @@ Item {
     repeat: true
     running: true
     onTriggered: root.advanceIfDue()
+  }
+
+  IdleMonitor {
+    id: idleMonitor
+    enabled: root.pauseWhenIdleCfg && root.videoPath !== ""
+    timeout: root.idlePauseSecondsCfg
+    respectInhibitors: false
+    onIsIdleChanged: root.recomputeSystemPause()
+  }
+
+  Connections {
+    target: UPower
+    function onOnBatteryChanged() { root.recomputeSystemPause() }
+  }
+
+  Connections {
+    target: root
+    function onVideoPathChanged() { root.recomputeSystemPause() }
+  }
+
+  Process {
+    id: pauseConfigProc
+    // Deliberately not `.pauseOnBattery // true` — jq's `//` treats `false`
+    // as falsy too, so an explicit `false` in the config would silently
+    // read back as the default `true`. Using an explicit null-check keeps
+    // "the key is absent" distinct from "the key is false".
+    command: ["bash", "-c",
+      "jq -r '(.pauseOnBattery) as $a | (.pauseWhenIdle) as $b | (.idlePauseSeconds) as $c | \"\\(if $a == null then true else $a end) \\(if $b == null then true else $b end) \\(if $c == null then 120 else $c end)\"' \"$1\" 2>/dev/null || printf 'true true 120\\n'",
+      "_", root.userConfigPath]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var parts = String(text || "true true 120").trim().split(/\s+/)
+        root.pauseOnBatteryCfg = parts[0] !== "false"
+        root.pauseWhenIdleCfg = parts[1] !== "false"
+        var secs = parseInt(parts[2], 10)
+        root.idlePauseSecondsCfg = (isFinite(secs) && secs >= 10) ? secs : 120
+        root.recomputeSystemPause()
+      }
+    }
+  }
+
+  FileView {
+    id: userConfigWatcher
+    path: root.userConfigPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.reloadPauseConfig()
   }
 
   IpcHandler {
@@ -270,6 +349,7 @@ Item {
     wireMenuProc.running = true
     resumeProc.running = true
     preparePickerProc.running = true
+    reloadPauseConfig()
   }
 
   Component.onDestruction: Quickshell.execDetached(["bash", "-c", 'p="$1"; [[ ! -L "$p" && -f "$p" && -x "$p" ]] && exec "$p" --cleanup-after-unload', "bash", root.cleanupHelper])
@@ -299,11 +379,30 @@ Item {
           return
         }
         player.source = Util.fileUrl(root.videoPath)
-        player.play()
+        // Skip the initial decode entirely when already system-paused
+        // (e.g. the video changed while the user was idle) — refreshPlayback
+        // picks it up the moment the pause lifts.
+        if (!root.systemPaused) player.play()
         Qt.callLater(function() {
           if (panel.playerGeneration === generation && root.playGeneration === generation)
             panel.acceptedGeneration = generation
         })
+      }
+
+      // Single source of truth for whether the player should currently be
+      // decoding+playing. System pause (battery/idle) always wins; once it
+      // lifts, this re-derives the same reveal/frame-ready gating syncPlayer
+      // and the frame-ready handler already relied on, rather than forcing
+      // playback regardless of where the pre-reveal dance was.
+      function refreshPlayback() {
+        if (root.videoPath === "" || panel.playerGeneration !== root.playGeneration) return
+        if (root.systemPaused) {
+          player.pause()
+        } else if (panel.frameDecoded && !root.revealVideo) {
+          player.pause()
+        } else {
+          player.play()
+        }
       }
 
       screen: modelData
@@ -337,10 +436,8 @@ Item {
       Connections {
         target: root
         function onPlayGenerationChanged() { panel.syncPlayer() }
-        function onRevealVideoChanged() {
-          if (root.revealVideo && panel.frameDecoded && panel.playerGeneration === root.playGeneration)
-            player.play()
-        }
+        function onRevealVideoChanged() { panel.refreshPlayback() }
+        function onSystemPausedChanged() { panel.refreshPlayback() }
       }
 
       Connections {
@@ -350,7 +447,7 @@ Item {
               && panel.acceptedGeneration === root.playGeneration
               && panel.playerGeneration === root.playGeneration) {
             panel.frameDecoded = true
-            if (!root.revealVideo) player.pause()
+            panel.refreshPlayback()
             root.markFrameReady(panel.modelData.name)
           }
         }
