@@ -1102,22 +1102,71 @@ EOF_EXTS
 }
 
 # ---- menu ----
+# omarchy-menu.jsonc is shared with every other plugin's menu entries, and
+# it's JSONC (// line comments), which jq can't parse directly. Our own
+# sed-based line edits assume each managed entry stays on a single line —
+# true for what we write, but not guaranteed if the user hand-reformats the
+# file. strip_jsonc_comments + validate_jsonc let us refuse to write back a
+# result that isn't valid JSON once comments are stripped, so a shape we
+# didn't anticipate fails safely (original file untouched) instead of
+# corrupting a file every other plugin's menu entry also lives in.
+strip_jsonc_comments() {
+  # stdout: $1 with // line-comments removed, string-literal aware (does
+  # not handle /* */ block comments — omarchy's own generator doesn't
+  # emit them, so their presence just means validation conservatively
+  # fails closed rather than silently mis-stripping inside a string).
+  awk '
+    {
+      line = $0; out = ""; in_str = 0; esc = 0; n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (in_str) {
+          out = out c
+          if (esc) { esc = 0 }
+          else if (c == "\\") { esc = 1 }
+          else if (c == "\"") { in_str = 0 }
+          continue
+        }
+        if (c == "\"") { in_str = 1; out = out c; continue }
+        if (c == "/" && substr(line, i + 1, 1) == "/") { break }
+        out = out c
+      }
+      print out
+    }
+  ' "$1" 2>/dev/null
+}
+
+validate_jsonc() {
+  local file="$1"
+  [[ -f $file ]] || return 1
+  # Omarchy's own JSONC template ships with trailing commas before a
+  # closing brace/bracket (common when the last real member is followed
+  # by a block of // comments), so the tolerance level to match is
+  # "comments + trailing commas", not strict JSON — otherwise this
+  # validation would reject the file omarchy itself ships.
+  strip_jsonc_comments "$file" \
+    | sed -E ':a;N;$!ba;s/,([[:space:]]*[]}])/\1/g' \
+    | jq empty >/dev/null 2>&1
+}
+
 menu_upsert_row() {
   # menu_upsert_row <file> <key> <entry-json>
   local file="$1" key="$2" entry="$3" tmp esc_entry
   # escape for sed replacement: backslashes first, then &
   esc_entry=$(printf '%s' "$entry" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g')
+  tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+  cp -f "$file" "$tmp"
   if grep -qE "^[[:space:]]*\"${key}\"[[:space:]]*:" "$file"; then
-    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    cp -f "$file" "$tmp"
     sed -i -E "s|^([[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*).*$|\1$esc_entry,|" "$tmp"
-    mv -f "$tmp" "$file"
   else
-    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    cp -f "$file" "$tmp"
     sed -i "0,/^[[:space:]]*{/a\  \"${key}\": $entry," "$tmp"
-    mv -f "$tmp" "$file"
   fi
+  if ! validate_jsonc "$tmp"; then
+    echo "wallpaper-engine: refusing to write $file — edit would break JSON (leaving it untouched)" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$file"
 }
 
 ensure_menu_override() {
@@ -1131,7 +1180,12 @@ ensure_menu_override() {
   local tmp
   if [[ ! -f $file ]]; then
     tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    printf '{\n  "style.background": %s\n  "style.wallpaper-engine": %s\n}\n' "$entry" "$gallery" >"$tmp"
+    printf '{\n  "style.background": %s,\n  "style.wallpaper-engine": %s\n}\n' "$entry" "$gallery" >"$tmp"
+    if ! validate_jsonc "$tmp"; then
+      echo "wallpaper-engine: refusing to write $file — generated JSON was invalid" >&2
+      rm -f "$tmp"
+      return 1
+    fi
     mv -f "$tmp" "$file"
   else
     menu_upsert_row "$file" "style.background" "$entry" || return 1
@@ -1149,6 +1203,11 @@ unwire_menu_override() {
   cp -f "$file" "$tmp"
   sed -i -E '\|^[[:space:]]*"style\.background".*sebas\.wallpaper-engine/wallpaper-engine\.sh.*$|d' "$tmp"
   sed -i -E '\|^[[:space:]]*"style\.wallpaper-engine".*sebas\.wallpaper-engine.*$|d' "$tmp"
+  if ! validate_jsonc "$tmp"; then
+    echo "wallpaper-engine: refusing to write $file — edit would break JSON (leaving it untouched)" >&2
+    rm -f "$tmp"
+    return 1
+  fi
   mv -f "$tmp" "$file"
   omarchy menu refresh >/dev/null 2>&1 || true
 }
