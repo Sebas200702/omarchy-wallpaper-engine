@@ -30,7 +30,7 @@ BarWidget {
       var s = nextInSec % 60
       parts.push("next in " + m + "m " + s + "s")
     }
-    parts.push("click: next · right: pause · middle: prev")
+    parts.push("click: gallery · right: next · middle: pause")
     return parts.join("\n")
   }
 
@@ -52,14 +52,15 @@ BarWidget {
     tooltipText: root.tooltip()
     onPressed: function(btn) {
       if (btn === Qt.RightButton) {
-        Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "toggle"])
-        Qt.callLater(root.refresh)
-      } else if (btn === Qt.MiddleButton) {
-        Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "prev"])
-        Qt.callLater(root.refresh)
-      } else {
         Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "next"])
         Qt.callLater(root.refresh)
+      } else if (btn === Qt.MiddleButton) {
+        Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "toggle"])
+        Qt.callLater(root.refresh)
+      } else if (root.bar) {
+        root.bar.run("omarchy-shell shell summon sebas.wallpaper-engine '{}'")
+      } else {
+        Quickshell.execDetached(["omarchy-shell", "shell", "summon", "sebas.wallpaper-engine", "{}"])
       }
     }
   }

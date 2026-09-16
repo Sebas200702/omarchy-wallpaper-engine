@@ -628,6 +628,108 @@ online_clear() {
   printf '%s\n' "$cur"
 }
 
+# ---- panel backend (JSON for Panel.qml) ----
+grid_local_json() {
+  local limit="${1:-120}" tmp cur
+  tmp=$(mktemp) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN
+  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
+  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+  build_playlist 2>/dev/null | head -n "$limit" | while IFS= read -r f; do prewarm_media "$f"; done >"$tmp" 2>/dev/null
+  cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
+  jq -R -s --arg cur "$cur" '
+    [split("\n")[] | select(length > 0) | split("\t")
+     | select(length >= 2)
+     | {key: .[0], title: (.[0] | split("/") | last | sub("\\.[^./]+$"; "") | gsub("[-_]+"; " ")),
+        thumb: .[1],
+        kind: (if .[0] | test("\\.(mp4|mkv|webm|mov|m4v)$"; "i") then "video" else "image" end),
+        current: (.[0] == $cur)}]' "$tmp"
+}
+
+grid_search_json() {
+  local provider="$1"; shift
+  local query="${*:-anime}"
+  local cap=12 i=0
+  : >"$online_meta"
+  local rows
+  rows=$(mktemp) || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f '$rows'" RETURN
+  if [[ $provider == wallhaven ]]; then
+    local categories purity sorting atleast ratios
+    categories=$(cfg '.wallhaven.categories' '111'); purity=$(cfg '.wallhaven.purity' '100')
+    sorting=$(cfg '.wallhaven.sorting' 'random'); atleast=$(cfg '.wallhaven.atleast' '1920x1080')
+    ratios=$(cfg '.wallhaven.ratios' '16x9')
+    local id page full thumb slug stub
+    while IFS=$'\t' read -r id page full thumb; do
+      [[ -n $id && -n $full && -n $thumb ]] || continue
+      (( i++ )); (( i > cap )) && break
+      slug="wh-$(safe_slug "$query")-$id"
+      stub="$cache_dir/online/${slug}.jpg"
+      if [[ ! -s $stub ]]; then
+        curl -sSL -m 25 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
+          && mv -f "$stub.tmp" "$stub" || continue
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "image" "$page" "$id" "$id" >>"$rows"
+      printf '%s\twallhaven\t%s\t%s\t%s\n' "$stub" "$full" "$page" "$id" >>"$online_meta"
+    done < <(wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" 1)
+  elif [[ $provider == moewalls ]]; then
+    local id title page_url thumb preview token dtitle slug stub detail
+    while IFS=$'\t' read -r id title page_url; do
+      [[ -n $page_url ]] || continue
+      (( i++ )); (( i > cap )) && break
+      detail=$(moewalls_detail "$page_url" 2>/dev/null) || continue
+      IFS=$'\t' read -r thumb preview token dtitle <<<"$detail"
+      [[ -n $token ]] || continue
+      [[ -n $dtitle ]] && title="$dtitle"
+      slug="moe-$(safe_slug "$title")-$id"
+      stub="$cache_dir/online/${slug}.jpg"
+      if [[ ! -s $stub ]]; then
+        if [[ -n $thumb ]]; then
+          curl -sSL -m 25 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
+        elif [[ -n $preview ]]; then
+          curl -sSL -m 25 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
+          timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "$cache_dir/online/${slug}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue
+        else
+          continue
+        fi
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" >>"$rows"
+      printf '%s\tmoewalls\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" >>"$online_meta"
+    done < <(moewalls_search "$query" "$cap")
+  else
+    return 1
+  fi
+  jq -R -s '
+    [split("\n")[] | select(length > 0) | split("\t")
+     | select(length >= 5)
+     | {key: .[0], kind: .[1], page: .[2], title: .[3], thumb: .[0]}]' "$rows"
+}
+
+config_get_json() {
+  do_status | jq --slurpfile cfg "$user_config" '{status: ., config: $cfg[0]}'
+}
+
+config_set_key() {
+  local key="$1" val="$2" tmp
+  tmp=$(mktemp) || return 1
+  case "$key" in
+    interval)
+      [[ $val =~ ^[0-9]+$ && $val -ge 1 && $val -le 1440 ]] || { echo "interval must be 1-1440" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" '.intervalMinutes = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    mode)
+      [[ $val == shuffle || $val == sequential ]] || { echo "mode must be shuffle|sequential" >&2; rm -f "$tmp"; return 1; }
+      jq --arg m "$val" '.mode = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    enabled)
+      [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    *) echo "unknown key: $key" >&2; rm -f "$tmp"; return 1 ;;
+  esac
+  mv -f "$tmp" "$user_config"
+  config_get_json
+}
+
 # ---- picker ----
 prewarm_media() {
   local media="$1" thumbnail
@@ -785,28 +887,40 @@ EOF_EXTS
 }
 
 # ---- menu ----
+menu_upsert_row() {
+  # menu_upsert_row <file> <key> <entry-json>
+  local file="$1" key="$2" entry="$3" tmp esc_entry
+  # escape for sed replacement: backslashes first, then &
+  esc_entry=$(printf '%s' "$entry" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g')
+  if grep -qE "^[[:space:]]*\"${key}\"[[:space:]]*:" "$file"; then
+    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+    cp -f "$file" "$tmp"
+    sed -i -E "s|^([[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*).*$|\1$esc_entry,|" "$tmp"
+    mv -f "$tmp" "$file"
+  else
+    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+    cp -f "$file" "$tmp"
+    sed -i "0,/^[[:space:]]*{/a\  \"${key}\": $entry," "$tmp"
+    mv -f "$tmp" "$file"
+  fi
+}
+
 ensure_menu_override() {
   local file="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
   local action="$HOME/.config/omarchy/plugins/$plugin_id/wallpaper-engine.sh"
   local entry="{\"icon\":\"\",\"label\":\"Background\",\"aliases\":[\"background\",\"wallpaper\"],\"action\":\"$action\"}"
+  local gallery="{\"icon\":\"\\uf03e\",\"label\":\"Wallpaper Engine\",\"aliases\":[\"wallpaper engine\",\"wallpapers\"],\"action\":\"omarchy-shell shell summon $plugin_id\"}"
   mkdir -p "$(dirname "$file")"
   chmod 0700 "$(dirname "$file")" 2>/dev/null || true
   [[ -L "$file" ]] && rm -f "$file"
   local tmp
   if [[ ! -f $file ]]; then
     tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    printf '{\n  "style.background": %s\n}\n' "$entry" >"$tmp"
-    mv -f "$tmp" "$file"
-  elif grep -qE '^[[:space:]]*"style\.background"[[:space:]]*:' "$file"; then
-    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    cp -f "$file" "$tmp"
-    sed -i -E "s|^([[:space:]]*\"style\.background\"[[:space:]]*:[[:space:]]*).*$|\1$entry,|" "$tmp"
+    printf '{\n  "style.background": %s\n  "style.wallpaper-engine": %s\n}\n' "$entry" "$gallery" >"$tmp"
     mv -f "$tmp" "$file"
   else
-    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
-    cp -f "$file" "$tmp"
-    sed -i "0,/^[[:space:]]*{/a\  \"style.background\": $entry," "$tmp"
-    mv -f "$tmp" "$file"
+    menu_upsert_row "$file" "style.background" "$entry" || return 1
+    menu_upsert_row "$file" "style.wallpaper-engine" "$gallery" || return 1
   fi
   omarchy menu refresh >/dev/null 2>&1 || true
 }
@@ -819,6 +933,7 @@ unwire_menu_override() {
   tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
   cp -f "$file" "$tmp"
   sed -i -E '\|^[[:space:]]*"style\.background".*sebas\.wallpaper-engine/wallpaper-engine\.sh.*$|d' "$tmp"
+  sed -i -E '\|^[[:space:]]*"style\.wallpaper-engine".*sebas\.wallpaper-engine.*$|d' "$tmp"
   mv -f "$tmp" "$file"
   omarchy menu refresh >/dev/null 2>&1 || true
 }
@@ -874,6 +989,8 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh set <file>
   wallpaper-engine.sh interval <min> | enable | disable
   wallpaper-engine.sh search wallhaven|moewalls <query>
+  wallpaper-engine.sh grid-local | grid-search wallhaven|moewalls <query>
+  wallpaper-engine.sh apply-key <key> | config-get | config-set <key> <value>
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -921,6 +1038,21 @@ case "${1:-}" in
     jq -n --argjson bytes "${cur:-0}" --argjson max "${max:-0}" --argjson files "$count" \
       '{cacheBytes:$bytes, maxBytes:$max, files:$files}' ;;
   online-clear) online_clear "${2:-}" ;;
+  grid-local) grid_local_json "${2:-120}" ;;
+  grid-search)
+    case "${2:-}" in
+      wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;
+      moewalls|moe|moewalls.com) shift 2; grid_search_json moewalls "${*:-anime}" ;;
+      *) echo "usage: grid-search wallhaven|moewalls <query>" >&2; exit 1 ;;
+    esac
+    ;;
+  apply-key)
+    [[ -n ${2:-} ]] || { echo "usage: apply-key <key>" >&2; exit 1; }
+    online_apply_stub "$2" && cat "$current_state" ;;
+  config-get) config_get_json ;;
+  config-set)
+    [[ -n ${2:-} && -n ${3:-} ]] || { echo "usage: config-set interval|mode|enabled <value>" >&2; exit 1; }
+    config_set_key "$2" "$3" ;;
   -h|--help|help) usage ;;
   "") local_picker ;;
   *) echo "unknown command: $1" >&2; usage >&2; exit 1 ;;

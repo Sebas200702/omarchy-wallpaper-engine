@@ -5,10 +5,15 @@
   "version": "0.1.0",
   "author": "sebas",
   "description": "Rotating wallpaper engine: local images+videos with timed shuffle, schedules, and online search (Wallhaven + MoeWalls).",
-  "kinds": ["service", "bar-widget"],
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
   "entryPoints": {
     "service": "Service.qml",
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Wallpaper Engine",
