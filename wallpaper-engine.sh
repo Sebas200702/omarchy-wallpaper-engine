@@ -1339,9 +1339,12 @@ validate_jsonc() {
   # by a block of // comments), so the tolerance level to match is
   # "comments + trailing commas", not strict JSON — otherwise this
   # validation would reject the file omarchy itself ships.
-  strip_jsonc_comments "$file" \
+  if strip_jsonc_comments "$file" \
     | sed -E ':a;N;$!ba;s/,([[:space:]]*[]}])/\1/g' \
-    | jq empty >/dev/null 2>&1
+    | jq empty >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
 menu_upsert_row() {
