@@ -30,6 +30,27 @@ readonly MAX_ROWS=1200
 readonly MAX_ROW_BYTES=2097152
 readonly ONLINE_PER_PAGE=24
 
+# run_curl_killable <curl-arg>... — runs curl in the background and forwards
+# TERM/INT to it, then waits. A plain foreground `curl ...` does NOT get
+# killed when this script does: bash's default disposition for TERM/INT
+# while blocked in a foreground wait is to terminate the shell itself
+# immediately, orphaning the still-running child — verified empirically.
+# That matters here because the Panel's Cancel button works by killing the
+# Process running this script (e.g. mid apply-key download): without this,
+# Cancel only stops the UI from tracking the download, while curl itself
+# keeps running in the background until its own -m timeout. Exit status
+# mirrors what a plain `curl "$@"` would have set.
+run_curl_killable() {
+  curl "$@" &
+  local cpid=$! rc
+  # shellcheck disable=SC2064 -- intentional: expand $cpid now, not at trap time
+  trap "kill -TERM $cpid 2>/dev/null; wait $cpid 2>/dev/null; exit 143" TERM INT
+  wait "$cpid"
+  rc=$?
+  trap - TERM INT
+  return "$rc"
+}
+
 # shellcheck disable=SC1091
 [[ -f "$plugin_dir/providers/wallhaven.sh" ]] && source "$plugin_dir/providers/wallhaven.sh"
 [[ -f "$plugin_dir/providers/moewalls.sh" ]] && source "$plugin_dir/providers/moewalls.sh"

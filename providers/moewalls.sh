@@ -65,7 +65,7 @@ moewalls_download() {
   # parsing.
   [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .moe.XXXXXX) || return 1
-  if ! curl -sSL --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
+  if ! run_curl_killable -sSL --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
       -o "$tmp" "$(moewalls_download_url "$token")"; then
     rm -f "$tmp"; return 1
   fi

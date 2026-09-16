@@ -26,7 +26,7 @@ wallhaven_download() {
   local tmp ctype size
   [[ $full_url == https://w.wallhaven.cc/* ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .wh.XXXXXX) || return 1
-  if ! curl -sSL --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
+  if ! run_curl_killable -sSL --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
     rm -f "$tmp"; return 1
   fi
   ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
