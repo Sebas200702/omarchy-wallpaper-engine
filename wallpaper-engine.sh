@@ -1,0 +1,927 @@
+#!/bin/bash
+# Wallpaper Engine for Omarchy — rotating local images+videos + online search.
+# Fork-inspired by tenzin.live-wallpaper (picker/IPC/state patterns reused).
+set -uo pipefail
+
+readonly plugin_id="sebas.wallpaper-engine"
+readonly plugin_dir="$HOME/.config/omarchy/plugins/$plugin_id"
+readonly state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/wallpaper-engine"
+readonly cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/wallpaper-engine"
+readonly online_dir_name="online"
+readonly stock_thumbnail_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/image-selector"
+readonly user_config="$HOME/.config/omarchy/wallpaper-engine.json"
+readonly video_state="$state_dir/video"
+readonly poster_state="$state_dir/poster"
+readonly expected_state="$state_dir/expected"
+readonly fallback_state="$state_dir/fallback"
+readonly queue_state="$state_dir/queue"
+readonly history_state="$state_dir/history"
+readonly lastchange_state="$state_dir/last-change"
+readonly paused_state="$state_dir/paused"
+readonly current_state="$state_dir/current"
+readonly online_meta="$state_dir/online-meta.tsv"
+readonly cleanup_helper="$state_dir/cleanup"
+readonly rows_cache="$state_dir/picker-rows"
+readonly rows_signature_state="$state_dir/picker-signature"
+readonly transition_lock="$state_dir/transition.lock"
+readonly rows_lock="$state_dir/picker.lock"
+readonly MAX_VIDEO_BYTES=524288000
+readonly MAX_ROWS=500
+readonly MAX_ROW_BYTES=2097152
+readonly ONLINE_PER_PAGE=24
+
+# shellcheck disable=SC1091
+[[ -f "$plugin_dir/providers/wallhaven.sh" ]] && source "$plugin_dir/providers/wallhaven.sh"
+[[ -f "$plugin_dir/providers/moewalls.sh" ]] && source "$plugin_dir/providers/moewalls.sh"
+
+ensure_secure_dir() {
+  local dir="$1"
+  [[ -L "$dir" ]] && { echo "refusing symlinked dir: $dir" >&2; return 1; }
+  mkdir -p -m 0700 "$dir" 2>/dev/null || return 1
+  chmod 0700 "$dir" 2>/dev/null || true
+  [[ -L "$dir" || ! -d "$dir" ]] && return 1
+  return 0
+}
+
+ensure_secure_dir "$state_dir" || exit 1
+ensure_secure_dir "$cache_dir" || exit 1
+ensure_secure_dir "$cache_dir/online" 2>/dev/null || true
+
+atomic_write() {
+  local dest="$1" content="$2" dir tmp
+  dir=$(dirname "$dest")
+  ensure_secure_dir "$dir" || return 1
+  [[ -L "$dest" ]] && rm -f "$dest" 2>/dev/null || true
+  tmp=$(mktemp -p "$dir" .tmp.XXXXXX) || return 1
+  chmod 0600 "$tmp" 2>/dev/null || true
+  printf '%s\n' "$content" >"$tmp"
+  chmod 0600 "$tmp" 2>/dev/null || true
+  [[ -L "$dest" || -L "$dir" ]] && { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$dest"
+  chmod 0600 "$dest" 2>/dev/null || true
+}
+
+# ---- config ----
+ensure_config() {
+  if [[ ! -f $user_config ]]; then
+    if [[ -f $plugin_dir/config.example.json ]]; then
+      mkdir -p "$(dirname "$user_config")"
+      cp -f "$plugin_dir/config.example.json" "$user_config"
+      chmod 0600 "$user_config" 2>/dev/null || true
+    else
+      printf '{"enabled":true,"intervalMinutes":10,"mode":"shuffle","includeImages":true,"includeVideos":true,"transitionMs":420,"schedules":[]}\n' >"$user_config"
+    fi
+  fi
+}
+ensure_config
+
+cfg() {
+  # cfg <jq-filter> <default>
+  local filter="$1" def="${2:-}" val
+  val=$(jq -r "$filter // empty" "$user_config" 2>/dev/null) || val=""
+  [[ -z $val || $val == null ]] && printf '%s' "$def" || printf '%s' "$val"
+}
+
+is_video() {
+  local ext="${1##*.}"
+  ext="${ext,,}"
+  case ",$ext," in
+    ,mp4,|,mkv,|,webm,|,mov,|,m4v,) return 0 ;;
+  esac
+  return 1
+}
+
+is_image() {
+  local ext="${1##*.}"
+  ext="${ext,,}"
+  case ",$ext," in
+    ,jpg,|,jpeg,|,png,|,gif,|,bmp,|,webp,) return 0 ;;
+  esac
+  return 1
+}
+
+sanitize_theme_name() {
+  local raw="$1"
+  raw=$(printf '%s' "$raw" | tr -d '\n\r' | head -c 128)
+  raw=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -z $raw ]] && return 1
+  [[ $raw =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+  [[ $raw == *".."* ]] && return 1
+  printf '%s' "$raw"
+}
+
+theme_dirs() {
+  # echoes: theme_dir \n user_dir \n online_dir
+  local raw sanitized theme_dir user_dir
+  raw=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null | head -c 128)
+  sanitized=$(sanitize_theme_name "$raw" 2>/dev/null) || sanitized=""
+  theme_dir="$HOME/.local/state/omarchy/current/theme/backgrounds"
+  if [[ -n $sanitized ]]; then
+    user_dir="$HOME/.config/omarchy/backgrounds/$sanitized"
+  else
+    user_dir="$HOME/.config/omarchy/backgrounds"
+  fi
+  [[ $user_dir != "$HOME/.config/omarchy/backgrounds"* ]] && user_dir="$HOME/.config/omarchy/backgrounds"
+  printf '%s\n%s\n%s/%s\n' "$theme_dir" "$user_dir" "$user_dir" "$online_dir_name"
+}
+
+validate_wallpaper_path() {
+  local p="$1"
+  [[ -n $p ]] || return 1
+  (( ${#p} > 4096 )) && return 1
+  [[ $p == *$'\n'* || $p == *$'\t'* ]] && return 1
+  [[ $p == /* ]] || return 1
+  local canon
+  canon=$(readlink -f "$p" 2>/dev/null) || return 1
+  [[ -f $canon ]] || return 1
+  local allowed1="$HOME/.config/omarchy/backgrounds/"
+  local allowed2="$HOME/.local/state/omarchy/current/theme/backgrounds/"
+  local allowed2c
+  allowed2c="$(readlink -f "$allowed2" 2>/dev/null || echo "$allowed2")"
+  local allowed3="/usr/share/omarchy/"
+  local allowed4="$HOME/.local/share/omarchy/"
+  local allowed5="$cache_dir/online/"
+  if [[ $canon != "$allowed1"* && $canon != "$allowed2"* && $canon != "$allowed2c"* \
+     && $canon != "$allowed3"* && $canon != "$allowed4"* && $canon != "$allowed5"* ]]; then
+    return 1
+  fi
+  local sz
+  sz=$(stat -Lc '%s' "$canon" 2>/dev/null) || return 1
+  if (( sz > MAX_VIDEO_BYTES )) && is_video "$canon"; then return 1; fi
+  return 0
+}
+
+# ---- playlist ----
+build_playlist() {
+  # stdout: one absolute path per line
+  local inc_img inc_vid tdir udir odir
+  inc_img=$(cfg '.includeImages' 'true'); inc_vid=$(cfg '.includeVideos' 'true')
+  mapfile -t _dirs < <(theme_dirs)
+  tdir="${_dirs[0]}" udir="${_dirs[1]}" odir="${_dirs[2]}"
+  local args=()
+  if [[ $inc_img == true ]]; then
+    args+=( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp' )
+  fi
+  if [[ $inc_vid == true ]]; then
+    (( ${#args[@]} > 0 )) && args+=( -o )
+    args+=( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' -o -iname '*.m4v' )
+  fi
+  (( ${#args[@]} == 0 )) && return 0
+  local d
+  for d in "$tdir" "$udir" "$odir"; do
+    [[ -L "$d" ]] && continue
+    [[ -d "$d" ]] || continue
+    find -L "$d" -maxdepth 2 -type f \( "${args[@]}" \) -print 2>/dev/null
+  done | sort -u
+}
+
+refill_queue() {
+  local mode tmp
+  mode=$(cfg '.mode' 'shuffle')
+  tmp=$(mktemp) || return 1
+  if [[ $mode == sequential ]]; then
+    build_playlist >"$tmp"
+  else
+    build_playlist | shuf >"$tmp"
+  fi
+  # drop current so we don't repeat immediately
+  if [[ -s $current_state ]]; then
+    local cur
+    cur=$(<"$current_state")
+    grep -Fxv "$cur" "$tmp" >"$tmp.new" 2>/dev/null && mv -f "$tmp.new" "$tmp" || true
+  fi
+  head -n "$MAX_ROWS" "$tmp" >"$queue_state"
+  chmod 0600 "$queue_state" 2>/dev/null || true
+  rm -f "$tmp"
+}
+
+pop_queue() {
+  [[ -s $queue_state ]] || refill_queue
+  [[ -s $queue_state ]] || return 1
+  local next
+  next=$(head -n 1 "$queue_state")
+  tail -n +2 "$queue_state" >"$queue_state.new" && mv -f "$queue_state.new" "$queue_state"
+  printf '%s' "$next"
+}
+
+push_history() {
+  local f="$1"
+  [[ -n $f ]] || return 0
+  touch "$history_state" 2>/dev/null
+  { printf '%s\n' "$f"; cat "$history_state" 2>/dev/null; } | head -n 20 >"$history_state.new"
+  mv -f "$history_state.new" "$history_state"
+}
+
+# ---- IPC / apply ----
+play_video_ipc() {
+  local video="$1" transition_ms="${2:-0}" i
+  [[ $transition_ms =~ ^[0-9]+$ ]] || transition_ms=0
+  (( transition_ms > 4000 )) && transition_ms=4000
+  for i in {1..10}; do
+    if omarchy-shell -q "$plugin_id" play "$video" "$transition_ms" >/dev/null 2>&1; then return 0; fi
+    if omarchy-shell -q "$plugin_id" playSimple "$video" >/dev/null 2>&1; then return 0; fi
+    sleep 0.05
+  done
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 &
+  sleep 0.9
+  for i in {1..20}; do
+    if omarchy-shell -q "$plugin_id" play "$video" "$transition_ms" >/dev/null 2>&1; then return 0; fi
+    if omarchy-shell -q "$plugin_id" playSimple "$video" >/dev/null 2>&1; then return 0; fi
+    sleep 0.05
+  done
+  return 1
+}
+
+stop_video_ipc() {
+  omarchy-shell -q "$plugin_id" stop >/dev/null 2>&1 || true
+}
+
+thumbnail_for_video() {
+  local media="$1" signature hash thumbnail tmp fsize
+  [[ -f "$media" ]] || return 1
+  fsize=$(stat -Lc '%s' "$media" 2>/dev/null) || return 1
+  (( fsize > MAX_VIDEO_BYTES || fsize == 0 )) && return 1
+  signature=$(stat -Lc '%s:%Y' "$media") || return 1
+  hash=$(printf 'ffmpeg-v2:%s:%s' "$media" "$signature" | md5sum); hash="${hash%% *}"
+  thumbnail="$cache_dir/$hash.jpg"
+  [[ -L "$thumbnail" ]] && rm -f "$thumbnail"
+  if [[ ! -f $thumbnail ]]; then
+    ensure_secure_dir "$cache_dir" || return 1
+    tmp=$(mktemp -p "$cache_dir" ".${hash}.XXXXXX.jpg") || return 1
+    chmod 0600 "$tmp" 2>/dev/null || true
+    if ! timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -threads 1 -i "$media" -an \
+      -frames:v 1 -vf "scale=1536:-2:force_original_aspect_ratio=decrease" -q:v 3 -y "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      tmp=$(mktemp -p "$cache_dir" ".${hash}.XXXXXX.jpg") || return 1
+      chmod 0600 "$tmp" 2>/dev/null || true
+      timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -ss 1 -threads 1 -i "$media" -an \
+        -frames:v 1 -vf "scale=1536:-2:force_original_aspect_ratio=decrease" -q:v 3 -y "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
+    [[ -f "$tmp" ]] || return 1
+    chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$thumbnail"
+    chmod 0644 "$thumbnail" 2>/dev/null || true
+  fi
+  printf '%s' "$thumbnail"
+}
+
+picker_thumbnail_for_image() {
+  local media="$1" signature hash thumbnail tmp fsize
+  [[ -f "$media" ]] || return 1
+  fsize=$(stat -Lc '%s' "$media" 2>/dev/null) || return 1
+  (( fsize == 0 )) && return 1
+  if [[ -s $stock_thumbnail_dir/index.tsv && ! -L $stock_thumbnail_dir/index.tsv ]]; then
+    signature=$(stat -Lc '%s:%Y' "$media") || return 1
+    hash=$(awk -F '\t' -v path="$media" -v sig="$signature" '$1 == path && $2 == sig { print $3; exit }' "$stock_thumbnail_dir/index.tsv")
+    if [[ $hash =~ ^[a-f0-9]+$ && -f $stock_thumbnail_dir/$hash.jpg && ! -L $stock_thumbnail_dir/$hash.jpg ]]; then
+      printf '%s' "$stock_thumbnail_dir/$hash.jpg"; return 0
+    fi
+  fi
+  signature=$(stat -Lc '%s:%Y' "$media") || return 1
+  hash=$(printf 'picker-v3:%s:%s' "$media" "$signature" | md5sum); hash="${hash%% *}"
+  thumbnail="$cache_dir/$hash.jpg"
+  [[ -L "$thumbnail" ]] && rm -f "$thumbnail"
+  if [[ ! -f $thumbnail ]]; then
+    ensure_secure_dir "$cache_dir" || return 1
+    tmp=$(mktemp -p "$cache_dir" ".${hash}.XXXXXX.jpg") || return 1
+    chmod 0600 "$tmp" 2>/dev/null || true
+    timeout 12 bash -c 'VIPS_CONCURRENCY=1 vipsthumbnail "$1" --size 1536x864 --smartcrop=centre --path "$2[Q=82,strip]" >/dev/null 2>&1' _ "$media" "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$thumbnail"
+    chmod 0644 "$thumbnail" 2>/dev/null || true
+  fi
+  printf '%s' "$thumbnail"
+}
+
+first_static_background() {
+  mapfile -t _dirs < <(theme_dirs)
+  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 2 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
+       -o -iname '*.bmp' -o -iname '*.webp' \) -print -quit 2>/dev/null
+}
+
+remember_static_background() {
+  local current_background
+  current_background=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
+  [[ -L "$fallback_state" ]] && rm -f "$fallback_state"
+  if [[ -s $fallback_state ]]; then return 0; fi
+  local fallback="$current_background"
+  if [[ -z $fallback || ! -f $fallback || $fallback == "$cache_dir/"* ]]; then
+    fallback=$(first_static_background)
+  fi
+  [[ -n $fallback && -f $fallback ]] && atomic_write "$fallback_state" "$fallback"
+}
+
+apply_file() {
+  # apply_file <path> [transition_ms] — image or video, updates all state
+  local file="$1" transition_ms="${2:-}" poster prev
+  [[ -z $transition_ms ]] && transition_ms=$(cfg '.transitionMs' '420')
+  validate_wallpaper_path "$file" || return 1
+  [[ -s $current_state ]] && prev=$(<"$current_state") || prev=""
+  [[ -n $prev && $prev != "$file" ]] && push_history "$prev"
+  if is_video "$file"; then
+    poster=$(thumbnail_for_video "$file") || { omarchy-notification-send "Could not read video file" -t 2000; return 1; }
+    [[ -L "$state_dir" ]] && return 1
+    exec 9>"$transition_lock"
+    flock -n 9 2>/dev/null || flock 9
+    remember_static_background
+    atomic_write "$video_state" "$file"
+    atomic_write "$poster_state" "$poster"
+    atomic_write "$expected_state" "$poster"
+    atomic_write "$current_state" "$file"
+    date +%s >"$lastchange_state"
+    if ! timeout 15 omarchy theme bg set "$poster" || ! play_video_ipc "$file" "$transition_ms"; then
+      restore_static_background
+      omarchy-notification-send "Could not set video wallpaper" -t 2000
+      return 1
+    fi
+  else
+    [[ -f $file ]] || return 1
+    stop_video_ipc
+    rm -f "$video_state" "$poster_state"
+    atomic_write "$expected_state" "$file"
+    atomic_write "$current_state" "$file"
+    date +%s >"$lastchange_state"
+    timeout 15 omarchy theme bg set "$file" || true
+  fi
+}
+
+restore_static_background() {
+  local fallback=""
+  stop_video_ipc
+  [[ -L "$fallback_state" ]] && rm -f "$fallback_state" || { [[ -s $fallback_state ]] && fallback=$(<"$fallback_state"); }
+  [[ -z $fallback || ! -f $fallback ]] && fallback=$(first_static_background)
+  [[ -n $fallback && -f $fallback ]] && omarchy theme bg set "$fallback" || true
+  rm -f "$video_state" "$poster_state" "$expected_state"
+}
+
+resume_engine() {
+  [[ -L "$video_state" || -L "$poster_state" ]] && { rm -f "$video_state" "$poster_state"; return 0; }
+  if [[ -s $video_state && -s $poster_state ]]; then
+    local video poster
+    video=$(<"$video_state"); poster=$(<"$poster_state")
+    if validate_wallpaper_path "$video" 2>/dev/null && [[ -f $poster ]]; then
+      [[ -s $expected_state ]] || atomic_write "$expected_state" "$poster"
+      [[ -s $current_state ]] || atomic_write "$current_state" "$video"
+      play_video_ipc "$video" 0
+      return 0
+    fi
+  fi
+  if [[ -s $current_state ]]; then
+    local cur
+    cur=$(<"$current_state")
+    if is_image "$cur" && [[ -f $cur ]]; then
+      [[ -s $expected_state ]] || atomic_write "$expected_state" "$cur"
+      return 0
+    fi
+  fi
+  # adopt whatever is on screen so rotation continues from here
+  local now_bg
+  now_bg=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
+  if [[ -n $now_bg && -f $now_bg ]]; then
+    atomic_write "$expected_state" "$now_bg"
+    atomic_write "$current_state" "$now_bg"
+    date +%s >"$lastchange_state"
+  fi
+}
+
+stop_if_changed() {
+  # Manual change adoption: user picked something outside the engine.
+  [[ -s $expected_state ]] || return 0
+  [[ -L "$expected_state" ]] && { rm -f "$expected_state"; return 0; }
+  exec 9>"$transition_lock"
+  flock -n 9 || return 0
+  local current expected
+  current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
+  expected=$(<"$expected_state")
+  [[ -n $current && $current == "$expected" ]] && return 0
+  # manual override → stop video if poster changed, adopt new current, reset timer
+  stop_video_ipc
+  rm -f "$video_state" "$poster_state"
+  atomic_write "$expected_state" "$current"
+  atomic_write "$current_state" "$current"
+  date +%s >"$lastchange_state"
+}
+
+resolve_schedule_pick() {
+  # resolve_schedule_pick <pick> -> absolute path or empty
+  local pick="$1"
+  [[ -n $pick ]] || return 1
+  if [[ $pick == /* ]]; then
+    validate_wallpaper_path "$pick" 2>/dev/null && printf '%s' "$pick" && return 0
+    return 1
+  fi
+  local base f
+  mapfile -t _dirs < <(theme_dirs)
+  for base in "${_dirs[0]}" "${_dirs[1]}" "${_dirs[2]}"; do
+    [[ -d "$base" ]] || continue
+    f=$(find -L "$base" -maxdepth 2 -type f -name "$pick" -print -quit 2>/dev/null)
+    if [[ -n $f ]]; then printf '%s' "$f"; return 0; fi
+    [[ -f "$base/$pick" ]] && { printf '%s' "$base/$pick"; return 0; }
+  done
+  return 1
+}
+
+advance_if_due() {
+  local enabled paused now last interval sched_time sched_pick sched_epoch
+  enabled=$(cfg '.enabled' 'true')
+  [[ $enabled == true ]] || return 0
+  [[ -f $paused_state && $(<"$paused_state") == 1 ]] && return 0
+  now=$(date +%s)
+  [[ -s $lastchange_state ]] || { printf '%s' "$now" >"$lastchange_state"; return 0; }
+  last=$(<"$lastchange_state"); [[ $last =~ ^[0-9]+$ ]] || last=$now
+  # 1) schedules win over interval
+  while IFS=$'\t' read -r sched_time sched_pick; do
+    [[ -n $sched_time && -n $sched_pick ]] || continue
+    [[ $sched_time =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || continue
+    sched_epoch=$(date -d "today $sched_time" +%s 2>/dev/null) || continue
+    (( sched_epoch > now )) && continue
+    (( last < sched_epoch )) || continue
+    local resolved
+    if resolved=$(resolve_schedule_pick "$sched_pick"); then
+      [[ -s $current_state && $(<"$current_state") == "$resolved" ]] && { printf '%s' "$now" >"$lastchange_state"; return 0; }
+      apply_file "$resolved" && return 0
+      return 1
+    fi
+  done < <(jq -r '.schedules[]? | [.time, .pick] | @tsv' "$user_config" 2>/dev/null)
+  # 2) interval
+  interval=$(cfg '.intervalMinutes' '10'); [[ $interval =~ ^[0-9]+$ ]] || interval=10
+  (( interval < 1 )) && interval=1
+  if (( now - last >= interval * 60 )); then
+    local next
+    if next=$(pop_queue) && [[ -n $next ]]; then
+      apply_file "$next" || return 1
+    fi
+  fi
+}
+
+do_next() {
+  local next
+  next=$(pop_queue) || { omarchy-notification-send "No wallpapers found" -t 2000; return 1; }
+  apply_file "$next"
+}
+
+do_prev() {
+  [[ -s $history_state ]] || { omarchy-notification-send "No previous wallpaper" -t 2000; return 1; }
+  local prev cur
+  prev=$(head -n 1 "$history_state")
+  tail -n +2 "$history_state" >"$history_state.new" && mv -f "$history_state.new" "$history_state"
+  [[ -s $current_state ]] && cur=$(<"$current_state") || cur=""
+  # put current back at queue front
+  if [[ -n $cur ]]; then
+    { printf '%s\n' "$cur"; cat "$queue_state" 2>/dev/null; } >"$queue_state.new" && mv -f "$queue_state.new" "$queue_state"
+  fi
+  # apply without pushing history again
+  local file="$prev" transition_ms
+  transition_ms=$(cfg '.transitionMs' '420')
+  validate_wallpaper_path "$file" || return 1
+  if is_video "$file"; then
+    local poster
+    poster=$(thumbnail_for_video "$file") || return 1
+    remember_static_background
+    atomic_write "$video_state" "$file"
+    atomic_write "$poster_state" "$poster"
+    atomic_write "$expected_state" "$poster"
+    atomic_write "$current_state" "$file"
+    date +%s >"$lastchange_state"
+    timeout 15 omarchy theme bg set "$poster" && play_video_ipc "$file" "$transition_ms"
+  else
+    stop_video_ipc
+    rm -f "$video_state" "$poster_state"
+    atomic_write "$expected_state" "$file"
+    atomic_write "$current_state" "$file"
+    date +%s >"$lastchange_state"
+    timeout 15 omarchy theme bg set "$file" || true
+  fi
+}
+
+do_status() {
+  local cur="" kind="none" active=false paused=false next_in="" queue_len=0 last now interval next_sched=""
+  [[ -s $current_state ]] && cur=$(<"$current_state")
+  if [[ -n $cur ]]; then is_video "$cur" && kind="video" || kind="image"; active=true; fi
+  [[ -f $paused_state && $(<"$paused_state") == 1 ]] && paused=true
+  [[ $(cfg '.enabled' 'true') != true ]] && paused=true
+  queue_len=0
+  [[ -f $queue_state ]] && queue_len=$(wc -l <"$queue_state" 2>/dev/null || echo 0)
+  now=$(date +%s); last=$(cat "$lastchange_state" 2>/dev/null || echo "$now")
+  [[ $last =~ ^[0-9]+$ ]] || last=$now
+  interval=$(cfg '.intervalMinutes' '10'); [[ $interval =~ ^[0-9]+$ ]] || interval=10
+  next_in=$(( interval * 60 - (now - last) ))
+  (( next_in < 0 )) && next_in=0
+  next_sched=$(jq -r '.schedules[]? | .time' "$user_config" 2>/dev/null | sort | awk -v now="$(date +%H:%M)" '$1 > now {print $1; exit}')
+  jq -n --arg cur "$cur" --arg kind "$kind" --argjson active "$active" --argjson paused "$paused" \
+    --argjson nextIn "$next_in" --argjson queue "$queue_len" --arg sched "$next_sched" \
+    '{active:$active, file:$cur, kind:$kind, paused:$paused, nextInSec:$nextIn, queueLen:$queue, nextSchedule:$sched}'
+}
+
+# ---- online ----
+safe_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g' | cut -c1-60 | sed 's/^-*//;s/-*$//'
+}
+
+online_search_wallhaven() {
+  local query="$1" categories purity sorting atleast ratios i id page full thumb title slug stub
+  categories=$(cfg '.wallhaven.categories' '111'); purity=$(cfg '.wallhaven.purity' '100')
+  sorting=$(cfg '.wallhaven.sorting' 'random'); atleast=$(cfg '.wallhaven.atleast' '1920x1080')
+  ratios=$(cfg '.wallhaven.ratios' '16x9')
+  rm -f "$online_meta"
+  local rows tmp_rows
+  tmp_rows=$(mktemp) || return 1
+  i=0
+  while IFS=$'\t' read -r id page full thumb; do
+    [[ -n $id && -n $full ]] || continue
+    (( i++ )); (( i > ONLINE_PER_PAGE )) && break
+    title="$id"
+    slug="wh-$(safe_slug "$query")-$id"
+    stub="$cache_dir/online/${slug}.jpg"
+    if [[ ! -s $stub ]]; then
+      curl -sSL -m 30 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
+        && mv -f "$stub.tmp" "$stub" || continue
+    fi
+    printf '%s\t%s\n' "$stub" "$stub" >>"$tmp_rows"
+    printf '%s\twallhaven\t%s\t%s\t%s\n' "$stub" "$full" "$page" "$title" >>"$online_meta"
+  done < <(wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" 1)
+  [[ -s $tmp_rows ]] || { rm -f "$tmp_rows"; omarchy-notification-send "No Wallhaven results" -t 2000; return 1; }
+  open_picker_rows "$tmp_rows" "online"
+  rm -f "$tmp_rows"
+}
+
+online_search_moewalls() {
+  local query="$1" i id title page_url thumb preview token dtitle slug stub
+  rm -f "$online_meta"
+  local tmp_rows
+  tmp_rows=$(mktemp) || return 1
+  i=0
+  while IFS=$'\t' read -r id title page_url; do
+    [[ -n $page_url ]] || continue
+    (( i++ )); (( i > ONLINE_PER_PAGE )) && break
+    local detail
+    detail=$(moewalls_detail "$page_url" 2>/dev/null) || continue
+    IFS=$'\t' read -r thumb preview token dtitle <<<"$detail"
+    [[ -n $token ]] || continue
+    [[ -n $dtitle ]] && title="$dtitle"
+    slug="moe-$(safe_slug "$title")-$id"
+    stub="$cache_dir/online/${slug}.jpg"
+    if [[ ! -s $stub ]]; then
+      if [[ -n $thumb ]]; then
+        curl -sSL -m 30 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
+      elif [[ -n $preview ]]; then
+        # fallback: frame from preview webm
+        curl -sSL -m 30 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
+        timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "$cache_dir/online/${slug}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue
+      else
+        continue
+      fi
+    fi
+    printf '%s\t%s\n' "$stub" "$stub" >>"$tmp_rows"
+    printf '%s\tmoewalls\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" >>"$online_meta"
+  done < <(moewalls_search "$query" "$ONLINE_PER_PAGE")
+  [[ -s $tmp_rows ]] || { rm -f "$tmp_rows"; omarchy-notification-send "No MoeWalls results" -t 2000; return 1; }
+  open_picker_rows "$tmp_rows" "online"
+  rm -f "$tmp_rows"
+}
+
+online_apply_stub() {
+  # online_apply_stub <stub-path> — downloads full file to online dir + applies
+  local stub="$1" line provider a b c max_bytes udir online_dir fname dest ext
+  [[ -f $online_meta ]] || return 1
+  line=$(grep -F -m1 "$stub"$'\t' "$online_meta") || return 1
+  IFS=$'\t' read -r _stub provider a b c <<<"$line"
+  mapfile -t _dirs < <(theme_dirs)
+  udir="${_dirs[1]}"; online_dir="${_dirs[2]}"
+  ensure_secure_dir "$online_dir" || return 1
+  max_bytes=$(cfg '.maxVideoBytes' "$MAX_VIDEO_BYTES")
+  if [[ $provider == wallhaven ]]; then
+    ext="${a##*.}"; ext="${ext%%\?*}"; [[ $ext =~ ^(jpg|jpeg|png|webp)$ ]] || ext="jpg"
+    fname="wh-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.${ext}"
+    dest="$online_dir/$fname"
+    omarchy-notification-send "Downloading wallpaper…" -t 1500
+    wallhaven_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    apply_file "$dest"
+  elif [[ $provider == moewalls ]]; then
+    fname="moe-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.mp4"
+    dest="$online_dir/$fname"
+    omarchy-notification-send "Downloading live wallpaper (50-100 MB)…" -t 2500
+    moewalls_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    apply_file "$dest"
+  else
+    return 1
+  fi
+}
+
+online_cache_bytes() {
+  du -sb "$cache_dir/online" 2>/dev/null | cut -f1
+}
+
+online_clear() {
+  local max_bytes keep
+  max_bytes=$(cfg '.onlineCacheMaxBytes' '536870912')
+  # prune LRU to half of max when over budget, or everything with --all
+  if [[ ${1:-} == --all ]]; then
+    rm -rf "$cache_dir/online"; ensure_secure_dir "$cache_dir/online"; return 0
+  fi
+  local cur
+  cur=$(online_cache_bytes); [[ $cur =~ ^[0-9]+$ ]] || cur=0
+  if (( cur > max_bytes )); then
+    find "$cache_dir/online" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n 50 | cut -d' ' -f2- | xargs -r rm -f
+  fi
+  printf '%s\n' "$cur"
+}
+
+# ---- picker ----
+prewarm_media() {
+  local media="$1" thumbnail
+  [[ $media == *$'\n'* || $media == *$'\t'* ]] && return 1
+  (( ${#media} > 4096 )) && return 1
+  [[ -f "$media" ]] || return 1
+  if is_video "$media"; then thumbnail=$(thumbnail_for_video "$media")
+  else thumbnail=$(picker_thumbnail_for_image "$media"); fi || return 1
+  printf '%s\t%s\n' "$media" "$thumbnail"
+}
+
+open_picker_rows() {
+  # open_picker_rows <rows_file> [mode] — mode=local|online
+  local rows_file="$1" mode="${2:-local}"
+  local selection_file done_file rows_b64 wallpaper
+  selection_file=$(mktemp); done_file=$(mktemp)
+  rm -f "$done_file"
+  # shellcheck disable=SC2064
+  trap "rm -f '$selection_file' '$done_file'" RETURN
+  rows_b64=$(base64 -w 0 <"$rows_file")
+  local selected=""
+  [[ -s $current_state ]] && selected=$(<"$current_state")
+  if ! timeout 30 bash -c 'omarchy-shell image-selector open "" "$1" "$2" "$3" "$4" false false >/dev/null 2>&1 | grep -qx ok' _ "$rows_b64" "$selected" "$selection_file" "$done_file"; then
+    if [[ $(timeout 30 omarchy-shell image-selector open "" "$rows_b64" "$selected" "$selection_file" "$done_file" false false 2>/dev/null) != ok ]]; then
+      return 1
+    fi
+  fi
+  local waited=0
+  while [[ ! -e $done_file ]]; do
+    sleep 0.05; waited=$((waited+1)); (( waited > 6000 )) && return 1
+  done
+  [[ -s $selection_file ]] || return 0
+  wallpaper=$(<"$selection_file")
+  wallpaper=$(printf '%s' "$wallpaper" | tr -d '\r' | head -c 4096)
+  wallpaper=$(printf '%s' "$wallpaper" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -n $wallpaper ]] || return 0
+  if [[ $mode == online ]]; then
+    online_apply_stub "$wallpaper"
+    return $?
+  fi
+  # local mode: must be in rows (protect against injection)
+  grep -Fxq "$wallpaper" <(cut -f1 "$rows_file" 2>/dev/null) 2>/dev/null || {
+    validate_wallpaper_path "$wallpaper" 2>/dev/null || return 1
+  }
+  # online stubs inside local picker (downloaded previews dir is local anyway) — plain apply
+  apply_file "$wallpaper"
+}
+
+local_picker() {
+  local media_args=() media_signature selection_file done_file rows_file
+  mapfile -t _dirs < <(theme_dirs)
+  local tdir="${_dirs[0]}" udir="${_dirs[1]}"
+  while IFS= read -r ext; do
+    (( ${#media_args[@]} > 0 )) && media_args+=(-o)
+    media_args+=(-iname "*.$ext")
+  done <<'EOF_EXTS'
+jpg
+jpeg
+png
+gif
+bmp
+webp
+mp4
+mkv
+webm
+mov
+m4v
+EOF_EXTS
+  media_signature=$(
+    {
+      printf 'engine-v1\0'
+      find -L "$tdir" "$udir" -maxdepth 2 -type f \( "${media_args[@]}" \) -printf '%p:%s:%T@\0' 2>/dev/null | sort -z
+    } | md5sum | cut -d ' ' -f 1
+  )
+  rows_file=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$rows_file'" RETURN
+  [[ -L "$rows_cache" ]] && rm -f "$rows_cache"
+  [[ -L "$rows_signature_state" ]] && rm -f "$rows_signature_state"
+  if [[ -s $rows_cache && -s $rows_signature_state && $(<"$rows_signature_state") == "$media_signature" ]]; then
+    cp "$rows_cache" "$rows_file"
+  else
+    [[ -L "$rows_lock" ]] && rm -f "$rows_lock"
+    exec 8>"$rows_lock"
+    if ! flock -n 8; then
+      [[ -s $rows_cache ]] && cp "$rows_cache" "$rows_file" || flock 8
+    fi
+    if [[ ! -s $rows_file ]]; then
+      if [[ -s $rows_cache && -s $rows_signature_state && $(<"$rows_signature_state") == "$media_signature" ]]; then
+        cp "$rows_cache" "$rows_file"
+      else
+        local workers
+        workers=$(nproc); (( workers > 6 )) && workers=6
+        export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
+        export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+        find -L "$tdir" "$udir" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
+          | timeout 30 xargs -0 -r -n 1 -P "$workers" bash -c 'prewarm_media "$1"' _ 2>/dev/null \
+          | head -n $MAX_ROWS | sort >"$rows_file" || true
+        if [[ -s $rows_file ]]; then
+          local rows_tmp sig_tmp rsz
+          rows_tmp=$(mktemp -p "$state_dir" .rows.XXXXXX) || true
+          sig_tmp=$(mktemp -p "$state_dir" .sig.XXXXXX) || true
+          if [[ -n $rows_tmp && -n $sig_tmp ]]; then
+            cp "$rows_file" "$rows_tmp" 2>/dev/null || true
+            rsz=$(stat -Lc '%s' "$rows_tmp" 2>/dev/null || echo 0)
+            if (( rsz <= MAX_ROW_BYTES )); then
+              chmod 0600 "$rows_tmp" 2>/dev/null || true
+              mv -f "$rows_tmp" "$rows_cache"
+              printf '%s\n' "$media_signature" >"$sig_tmp"
+              mv -f "$sig_tmp" "$rows_signature_state"
+            else
+              rm -f "$rows_tmp" "$sig_tmp"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+  [[ -s $rows_file ]] || { omarchy-notification-send "No wallpaper was found for theme" -t 2000; return 0; }
+  open_picker_rows "$rows_file" "local"
+}
+
+prepare_picker() {
+  local media_args=()
+  mapfile -t _dirs < <(theme_dirs)
+  while IFS= read -r ext; do
+    (( ${#media_args[@]} > 0 )) && media_args+=(-o)
+    media_args+=(-iname "*.$ext")
+  done <<'EOF_EXTS'
+jpg
+jpeg
+png
+gif
+bmp
+webp
+mp4
+mkv
+webm
+mov
+m4v
+EOF_EXTS
+  local rows_file selected rows_b64
+  rows_file=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$rows_file'" RETURN
+  export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
+  export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
+  find -L "${_dirs[0]}" "${_dirs[1]}" -maxdepth 2 -type f \( "${media_args[@]}" \) -print0 2>/dev/null \
+    | timeout 30 xargs -0 -r -n 1 -P 4 bash -c 'prewarm_media "$1"' _ 2>/dev/null \
+    | head -n $MAX_ROWS | sort >"$rows_file" || true
+  [[ -s $rows_file ]] || return 0
+  rows_b64=$(base64 -w 0 <"$rows_file")
+  selected=""; [[ -s $current_state ]] && selected=$(<"$current_state")
+  timeout 10 omarchy-shell image-selector preload "$rows_b64" "$selected" false false >/dev/null 2>&1 || true
+}
+
+# ---- menu ----
+ensure_menu_override() {
+  local file="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+  local action="$HOME/.config/omarchy/plugins/$plugin_id/wallpaper-engine.sh"
+  local entry="{\"icon\":\"\",\"label\":\"Background\",\"aliases\":[\"background\",\"wallpaper\"],\"action\":\"$action\"}"
+  mkdir -p "$(dirname "$file")"
+  chmod 0700 "$(dirname "$file")" 2>/dev/null || true
+  [[ -L "$file" ]] && rm -f "$file"
+  local tmp
+  if [[ ! -f $file ]]; then
+    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+    printf '{\n  "style.background": %s\n}\n' "$entry" >"$tmp"
+    mv -f "$tmp" "$file"
+  elif grep -qE '^[[:space:]]*"style\.background"[[:space:]]*:' "$file"; then
+    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+    cp -f "$file" "$tmp"
+    sed -i -E "s|^([[:space:]]*\"style\.background\"[[:space:]]*:[[:space:]]*).*$|\1$entry,|" "$tmp"
+    mv -f "$tmp" "$file"
+  else
+    tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+    cp -f "$file" "$tmp"
+    sed -i "0,/^[[:space:]]*{/a\  \"style.background\": $entry," "$tmp"
+    mv -f "$tmp" "$file"
+  fi
+  omarchy menu refresh >/dev/null 2>&1 || true
+}
+
+unwire_menu_override() {
+  local file="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+  [[ -f $file ]] || return 0
+  [[ -L "$file" ]] && { rm -f "$file"; return 0; }
+  local tmp
+  tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
+  cp -f "$file" "$tmp"
+  sed -i -E '\|^[[:space:]]*"style\.background".*sebas\.wallpaper-engine/wallpaper-engine\.sh.*$|d' "$tmp"
+  mv -f "$tmp" "$file"
+  omarchy menu refresh >/dev/null 2>&1 || true
+}
+
+prepare_cleanup_helper() {
+  ensure_secure_dir "$state_dir" || return 1
+  [[ -L "$state_dir" ]] && return 1
+  [[ -L "$cleanup_helper" ]] && rm -f "$cleanup_helper" 2>/dev/null || true
+  [[ -f "$plugin_dir/wallpaper-engine.sh" ]] || return 1
+  local tmp
+  tmp=$(mktemp -p "$state_dir" .cleanup.XXXXXX) || return 1
+  chmod 0600 "$tmp" 2>/dev/null || true
+  cp -f "$plugin_dir/wallpaper-engine.sh" "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0755 "$tmp"
+  [[ -L "$cleanup_helper" || -L "$state_dir" ]] && { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$cleanup_helper"
+  chmod 0755 "$cleanup_helper" 2>/dev/null || true
+}
+
+uninstall_plugin_state() {
+  local fallback=""
+  if [[ ! -L "$video_state" && ! -L "$fallback_state" ]] && [[ -s $video_state || -s $fallback_state ]]; then
+    [[ -s $fallback_state ]] && fallback=$(<"$fallback_state")
+    [[ -z $fallback || ! -f $fallback || $fallback == "$cache_dir/"* ]] && fallback=$(first_static_background)
+  fi
+  stop_video_ipc
+  if [[ -n $fallback && -f $fallback && ! -L $fallback ]]; then
+    omarchy theme bg set "$fallback" || true
+  fi
+  unwire_menu_override
+  rm -rf "$state_dir" "$cache_dir"
+}
+
+cleanup_after_unload() {
+  local enabled=""
+  for _ in {1..200}; do
+    if [[ ! -d $plugin_dir ]]; then
+      uninstall_plugin_state
+      return 0
+    fi
+    sleep 0.01
+  done
+  enabled=$(omarchy plugin list --json 2>/dev/null \
+    | jq -r --arg id "$plugin_id" '.[] | select(.id == $id) | .enabled' 2>/dev/null || true)
+  [[ $enabled == false ]] && unwire_menu_override
+}
+
+usage() {
+  cat <<'EOF'
+Wallpaper Engine — usage:
+  wallpaper-engine.sh                  open local picker (images+videos)
+  wallpaper-engine.sh next|prev|toggle|status
+  wallpaper-engine.sh set <file>
+  wallpaper-engine.sh interval <min> | enable | disable
+  wallpaper-engine.sh search wallhaven|moewalls <query>
+  wallpaper-engine.sh online-status | online-clear [--all]
+  wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
+  wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
+EOF
+}
+
+case "${1:-}" in
+  --resume) prepare_cleanup_helper || true; resume_engine; exit $? ;;
+  --stop-if-changed) stop_if_changed; exit 0 ;;
+  --advance-if-due) advance_if_due; exit $? ;;
+  --stop) stop_video_ipc; rm -f "$video_state" "$poster_state" "$expected_state"; exit 0 ;;
+  --wire-menu) ensure_menu_override; exit 0 ;;
+  --unwire-menu) unwire_menu_override; exit 0 ;;
+  --cleanup-after-unload) cleanup_after_unload; exit 0 ;;
+  --uninstall) uninstall_plugin_state; exit 0 ;;
+  --prepare-picker) prepare_picker; exit 0 ;;
+  next) do_next ;;
+  prev) do_prev ;;
+  set)
+    [[ -n ${2:-} ]] || { echo "usage: set <file>" >&2; exit 1; }
+    apply_file "$2" ;;
+  toggle)
+    cur=0; [[ -f $paused_state ]] && cur=$(<"$paused_state")
+    if [[ $cur == 1 ]]; then printf '0' >"$paused_state"; omarchy-notification-send "Wallpaper rotation on" -t 1500
+    else printf '1' >"$paused_state"; omarchy-notification-send "Wallpaper rotation paused" -t 1500; fi
+    ;;
+  status) do_status ;;
+  interval)
+    [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "usage: interval <minutes>" >&2; exit 1; }
+    tmp=$(mktemp) && jq --argjson m "${2}" '.intervalMinutes = $m' "$user_config" >"$tmp" && mv -f "$tmp" "$user_config"
+    date +%s >"$lastchange_state"
+    ;;
+  enable) tmp=$(mktemp) && jq '.enabled = true' "$user_config" >"$tmp" && mv -f "$tmp" "$user_config"; printf '0' >"$paused_state" 2>/dev/null || true ;;
+  disable) tmp=$(mktemp) && jq '.enabled = false' "$user_config" >"$tmp" && mv -f "$tmp" "$user_config" ;;
+  search)
+    case "${2:-}" in
+      wallhaven) shift 2; online_search_wallhaven "${*:-anime}" ;;
+      moewalls|moe|moewalls.com) shift 2; online_search_moewalls "${*:-anime}" ;;
+      *) echo "usage: search wallhaven|moewalls <query>" >&2; exit 1 ;;
+    esac
+    ;;
+  online-status)
+    cur=$(online_cache_bytes); max=$(cfg '.onlineCacheMaxBytes' '536870912')
+    count=$(find "$cache_dir/online" -type f 2>/dev/null | wc -l)
+    jq -n --argjson bytes "${cur:-0}" --argjson max "${max:-0}" --argjson files "$count" \
+      '{cacheBytes:$bytes, maxBytes:$max, files:$files}' ;;
+  online-clear) online_clear "${2:-}" ;;
+  -h|--help|help) usage ;;
+  "") local_picker ;;
+  *) echo "unknown command: $1" >&2; usage >&2; exit 1 ;;
+esac

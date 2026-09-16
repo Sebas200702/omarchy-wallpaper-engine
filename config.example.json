@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "intervalMinutes": 10,
+  "mode": "shuffle",
+  "includeImages": true,
+  "includeVideos": true,
+  "transitionMs": 420,
+  "schedules": [
+  ],
+  "maxVideoBytes": 524288000,
+  "onlineCacheMaxBytes": 536870912,
+  "wallhaven": {
+    "categories": "111",
+    "purity": "100",
+    "sorting": "random",
+    "atleast": "1920x1080",
+    "ratios": "16x9"
+  }
+}
