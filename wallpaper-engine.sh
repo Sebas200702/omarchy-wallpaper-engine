@@ -346,6 +346,25 @@ playlist_remove() {
   playlists_json
 }
 
+delete_wallpaper_file() {
+  # delete_wallpaper_file <path> — removes the file (+ its attribution
+  # sidecar, if any) from disk, drops it from every playlist that
+  # references it, and — if it was the one currently showing — advances
+  # rotation so no state is left pointing at a file that no longer exists.
+  local path="${1:-}" canon
+  [[ -n $path ]] || { echo "usage: delete-file <path>" >&2; return 1; }
+  validate_wallpaper_path "$path" || { echo "invalid or not an allowed wallpaper path: $path" >&2; return 1; }
+  canon=$(readlink -f "$path") || return 1
+  [[ -f $canon ]] || { echo "not found: $canon" >&2; return 1; }
+  rm -f -- "$canon" "${canon}.attribution.json" || { echo "could not delete: $canon" >&2; return 1; }
+  save_config_filtered '.playlists[]? |= (.items |= map(select(. != $f)))' --arg f "$canon" || true
+  reset_rotation_state
+  if [[ -s $current_state && $(<"$current_state") == "$canon" ]]; then
+    do_next >/dev/null 2>&1 || true
+  fi
+  jq -n --arg deleted "$canon" '{deleted: $deleted}'
+}
+
 playlist_activate() {
   if [[ ${1:-__all__} == __all__ ]]; then
     save_config_filtered '.activePlaylist = null' || return 1
@@ -808,6 +827,21 @@ online_search_moewalls() {
   rm -f "$tmp_rows"
 }
 
+# write_attribution_sidecar <downloaded-file> <provider> <source-page-url> <title>
+# Keeps track of where a downloaded wallpaper came from — the artist's
+# original page — next to the file itself, so the Panel can show it (and so
+# it survives online-meta.tsv being wiped on the next search). Sits outside
+# the media-extension allowlist every find/build_playlist uses, so it never
+# ends up in rotation.
+write_attribution_sidecar() {
+  local dest="$1" provider="$2" source_url="$3" title="$4" sidecar json
+  sidecar="${dest}.attribution.json"
+  json=$(jq -n --arg provider "$provider" --arg source "$source_url" --arg title "$title" \
+    --arg downloadedAt "$(date -Is)" \
+    '{provider: $provider, sourceUrl: $source, title: $title, downloadedAt: $downloadedAt}') || return 1
+  atomic_write "$sidecar" "$json"
+}
+
 online_apply_stub() {
   # online_apply_stub <stub-path> — downloads full file to online dir + applies
   local stub="$1" line provider a b c max_bytes udir online_dir fname dest ext
@@ -828,12 +862,14 @@ online_apply_stub() {
     dest="$online_dir/$fname"
     omarchy-notification-send "Downloading wallpaper…" -t 1500
     wallhaven_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    write_attribution_sidecar "$dest" "wallhaven" "$b" "$c"
     apply_file "$dest"
   elif [[ $provider == moewalls ]]; then
     fname="moe-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.mp4"
     dest="$online_dir/$fname"
     omarchy-notification-send "Downloading live wallpaper (50-100 MB)…" -t 2500
     moewalls_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    write_attribution_sidecar "$dest" "moewalls" "$b" "$c"
     apply_file "$dest"
   else
     return 1
@@ -890,8 +926,23 @@ grid_local_json() {
   if [[ $total_count =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ ]] && (( total_count > limit )); then
     printf 'TRUNCATED total=%s shown=%s\n' "$total_count" "$limit" >&2
   fi
+  # Attribution (where a downloaded online wallpaper came from) is kept in
+  # a sidecar next to the file, not in prewarm_media's own output — that
+  # TSV format is also consumed as-is by the native image-selector picker,
+  # so it must not gain a third field. Enrich only here, building a
+  # {path: attribution} map from whichever rows actually have a sidecar.
+  local attrs_tmp attrs_json media sc
+  attrs_tmp=$(mktemp) || return 1
+  while IFS=$'\t' read -r media _thumb; do
+    [[ -n $media ]] || continue
+    sc="${media}.attribution.json"
+    [[ -s $sc && ! -L $sc ]] || continue
+    jq -c --arg k "$media" '{key: $k, value: .}' "$sc" 2>/dev/null
+  done <"$tmp" >"$attrs_tmp"
+  attrs_json=$(jq -s 'map({(.key): .value}) | add // {}' "$attrs_tmp" 2>/dev/null) || attrs_json='{}'
+  rm -f "$attrs_tmp"
   cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
-  jq -R -s --arg cur "$cur" '
+  jq -R -s --arg cur "$cur" --argjson attrs "$attrs_json" '
     [split("\n")[] | select(length > 0) | split("\t")
      | select(length >= 2)
      | (.[0] | split("/") | last | sub("\\.[^./]+$"; "") | gsub("[-_]+"; " ")) as $t
@@ -899,7 +950,8 @@ grid_local_json() {
      | {key: .[0], title: $h,
         thumb: .[1],
         kind: (if .[0] | test("\\.(mp4|mkv|webm|mov|m4v)$"; "i") then "video" else "image" end),
-        current: (.[0] == $cur)}]' "$tmp"
+        current: (.[0] == $cur),
+        attribution: ($attrs[.[0]] // null)}]' "$tmp"
 }
 
 grid_search_json() {
@@ -1308,6 +1360,7 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh playlists | playlist-create <n> | playlist-delete <n>
   wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>
   wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
+  wallpaper-engine.sh delete-file <path>
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -1364,6 +1417,7 @@ case "${1:-}" in
   playlist-activate) playlist_activate "${2:-__all__}" ;;
   playlist-interval) playlist_set_interval "${2:-}" "${3:-}" ;;
   playlist-mode) playlist_set_mode "${2:-}" "${3:-}" ;;
+  delete-file) delete_wallpaper_file "${2:-}" ;;
   grid-search)
     case "${2:-}" in
       wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;
