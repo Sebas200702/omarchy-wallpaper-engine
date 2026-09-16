@@ -253,6 +253,59 @@ Item {
     root.selectedItem = item
   }
 
+  // Keyboard grid navigation: arrows move the selection (Up/Down by a full
+  // row, using gridFlow's own column count so it stays correct whether the
+  // window is showing 2 or 3 columns), Return/Enter applies it — the same
+  // selection state a mouse click sets, so this is a thin wrapper around
+  // cellClicked/applySelected rather than a second notion of "focus".
+  function moveSelection(dx, dy) {
+    if (root.selectMode || root.loading) return
+    var items = root.filteredItems()
+    if (items.length === 0) return
+    var idx = -1
+    if (root.selectedKey !== "") {
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].key === root.selectedKey) { idx = i; break }
+      }
+    }
+    if (idx === -1) {
+      idx = 0
+    } else if (dy !== 0) {
+      idx += dy * Math.max(1, gridFlow.cols)
+    } else {
+      idx += dx
+    }
+    if (idx < 0) idx = 0
+    if (idx > items.length - 1) idx = items.length - 1
+    root.cellClicked(items[idx])
+    root.scrollSelectionIntoView(idx)
+  }
+
+  function scrollSelectionIntoView(idx) {
+    // Mirrors the grid cell sizing in the Grid delegate below (width/cols,
+    // height: width * 9/16 + 32) to compute where row `idx` lands, since a
+    // plain Grid+Flickable (not a GridView) has no positionViewAtIndex.
+    var cols = Math.max(1, gridFlow.cols)
+    if (gridFlow.width <= 0) return
+    var cellW = (gridFlow.width - (cols - 1) * gridFlow.spacing) / cols
+    var cellH = cellW * 9 / 16 + 32
+    var row = Math.floor(idx / cols)
+    var top = row * (cellH + gridFlow.spacing)
+    var bottom = top + cellH
+    if (top < gridScroll.contentY) gridScroll.contentY = Math.max(0, top)
+    else if (bottom > gridScroll.contentY + gridScroll.height) gridScroll.contentY = bottom - gridScroll.height
+  }
+
+  function activateSelection() {
+    if (root.selectMode || root.loading) return
+    if (!root.selectedItem) {
+      var items = root.filteredItems()
+      if (items.length > 0) root.cellClicked(items[0])
+      return
+    }
+    root.applySelected()
+  }
+
   function toggleMark(key) {
     var next = {}
     var n = 0
@@ -776,6 +829,12 @@ Item {
       anchors.fill: parent
       focus: true
       Keys.onEscapePressed: root.dismiss()
+      Keys.onLeftPressed: root.moveSelection(-1, 0)
+      Keys.onRightPressed: root.moveSelection(1, 0)
+      Keys.onUpPressed: root.moveSelection(0, -1)
+      Keys.onDownPressed: root.moveSelection(0, 1)
+      Keys.onReturnPressed: root.activateSelection()
+      Keys.onEnterPressed: root.activateSelection()
 
       Item {
         id: cardBox
