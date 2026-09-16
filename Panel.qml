@@ -111,7 +111,19 @@ Item {
       error: root.errorText,
       selected: root.selectedKey,
       marked: root.markedCount,
-      playlists: pls
+      playlists: pls,
+      geom: {
+        screen: [Math.round(keyCatcher.width), Math.round(keyCatcher.height)],
+        scale: Number(cardBox.scale.toFixed(3)),
+        rowW: Math.round(centerRow.width),
+        rowImp: Math.round(centerRow.implicitWidth),
+        sideW: Math.round(sidePanel.width),
+        centerW: Math.round(centerCol.width),
+        centerImp: Math.round(centerCol.implicitWidth),
+        propsW: Math.round(propsPanel.width),
+        gridW: Math.round(gridFlow.width),
+        gridImp: Math.round(gridFlow.implicitWidth)
+      }
     })
   }
 
@@ -443,7 +455,7 @@ Item {
     property bool primary: false
     height: 34
     width: Math.max(58, actLabel.implicitWidth + 20)
-    radius: 8
+    radius: Style.cornerRadius
     color: !actBtn.enabled ? Util.alpha(root.onScrim, 0.06)
       : actBtn.primary ? root.accent : root.softFill
     opacity: !actBtn.enabled ? 0.5 : 1.0
@@ -718,43 +730,37 @@ Item {
       Keys.onEscapePressed: root.dismiss()
 
       Item {
+        id: cardBox
         anchors.centerIn: parent
         // Fixed design size, scaled down as a whole on small/scaled screens
         // (e.g. 1280x720 logical) so the card can never overflow the display.
-        width: 1120
-        height: 680
+        width: 1040
+        height: 660
         scale: Math.min(1,
-          (keyCatcher.width - 48) / 1120,
-          (keyCatcher.height - 48) / 680)
+          (keyCatcher.width - 64) / 1040,
+          (keyCatcher.height - 64) / 660)
 
         MouseArea { anchors.fill: parent; onClicked: {} }
 
         Rectangle {
           anchors.fill: parent
-          radius: 14
+          radius: Style.cornerRadius
           color: root.cardBg
           border.width: 1
           border.color: root.cardBorder
 
           RowLayout {
+            id: centerRow
             anchors.fill: parent
             spacing: 0
 
             // ============ SIDEBAR ============
             Rectangle {
-              Layout.preferredWidth: 208
+              id: sidePanel
+              Layout.preferredWidth: 200
               Layout.fillHeight: true
               color: root.insetFill
-              radius: 14
-
-              Rectangle {
-                // square off the right edge
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                width: 14
-                color: parent.color
-              }
+              radius: Style.cornerRadius
 
               ColumnLayout {
                 anchors.fill: parent
@@ -788,7 +794,7 @@ Item {
                     required property var modelData
                     Layout.fillWidth: true
                     height: 36
-                    radius: 8
+                    radius: Style.cornerRadius
                     color: root.view.section === modelData.section && root.view.name === ""
                       ? root.rowHover : "transparent"
                     border.width: root.view.section === modelData.section && root.view.name === "" ? 1 : 0
@@ -835,7 +841,7 @@ Item {
                     required property var modelData
                     Layout.fillWidth: true
                     height: 40
-                    radius: 8
+                    radius: Style.cornerRadius
                     color: root.view.section === "playlist" && root.view.name === modelData.name
                       ? root.rowHover : "transparent"
                     border.width: root.view.section === "playlist" && root.view.name === modelData.name ? 1 : 0
@@ -881,7 +887,7 @@ Item {
                   Rectangle {
                     Layout.fillWidth: true
                     height: 34
-                    radius: 8
+                    radius: Style.cornerRadius
                     color: root.softFill
 
                     TextInput {
@@ -936,7 +942,7 @@ Item {
                     required property var modelData
                     Layout.fillWidth: true
                     height: 36
-                    radius: 8
+                    radius: Style.cornerRadius
                     color: root.view.section === "online" && root.view.provider === modelData.provider
                       ? root.rowHover : "transparent"
                     border.width: root.view.section === "online" && root.view.provider === modelData.provider ? 1 : 0
@@ -998,6 +1004,7 @@ Item {
 
             // ============ CENTER ============
             ColumnLayout {
+              id: centerCol
               Layout.fillWidth: true
               Layout.fillHeight: true
               Layout.leftMargin: 18
@@ -1061,7 +1068,7 @@ Item {
                 Rectangle {
                   Layout.fillWidth: true
                   height: 38
-                  radius: 8
+                  radius: Style.cornerRadius
                   color: root.softFill
                   border.width: centerInput.activeFocus ? 1 : 0
                   border.color: root.accent
@@ -1160,14 +1167,14 @@ Item {
                 Rectangle {
                   Layout.fillWidth: true
                   height: 6
-                  radius: 3
+                  radius: Style.cornerRadius
                   color: root.softFill
 
                   Rectangle {
                     id: progressSlide
                     width: 120
                     height: parent.height
-                    radius: 3
+                    radius: Style.cornerRadius
                     color: root.accent
                   }
 
@@ -1238,7 +1245,7 @@ Item {
 
                       Rectangle {
                         anchors.fill: parent
-                        radius: 8
+                        radius: Style.cornerRadius
                         color: root.selectedKey === modelData.key
                           ? Util.alpha(root.accent, 0.22) : root.softFill
                         border.width: (root.selectedKey === modelData.key || modelData.current || root.marked[modelData.key]) ? 2 : 0
@@ -1263,7 +1270,7 @@ Item {
                           anchors.margins: 6
                           width: badgeText.implicitWidth + 14
                           height: 20
-                          radius: 5
+                          radius: Style.cornerRadius
                           color: Qt.rgba(0, 0, 0, 0.65)
 
                           Text {
@@ -1285,7 +1292,7 @@ Item {
                           anchors.margins: 6
                           width: 22
                           height: 22
-                          radius: 11
+                          radius: Style.cornerRadius
                           color: root.markedColor
 
                           Text {
@@ -1306,7 +1313,7 @@ Item {
                           anchors.margins: 6
                           width: 22
                           height: 22
-                          radius: 11
+                          radius: Style.cornerRadius
                           color: Qt.rgba(0, 0, 0, 0.65)
 
                           Text {
@@ -1405,7 +1412,8 @@ Item {
 
             // ============ PROPERTIES ============
             Rectangle {
-              Layout.preferredWidth: 248
+              id: propsPanel
+              Layout.preferredWidth: 240
               Layout.fillHeight: true
               color: root.insetFill
 
@@ -1433,7 +1441,7 @@ Item {
                   Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 150
-                    radius: 8
+                    radius: Style.cornerRadius
                     color: root.softFill
 
                     Image {
