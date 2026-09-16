@@ -175,14 +175,178 @@ build_playlist() {
   done | sort -u
 }
 
+# ---- playlists ----
+# Playlists live in the user config: .playlists[] = {name, intervalMinutes, mode, items[]}.
+# .activePlaylist = name | null (null = whole Library).
+active_playlist_name() {
+  jq -r '.activePlaylist // empty' "$user_config" 2>/dev/null
+}
+
+effective_interval() {
+  local ap m
+  ap=$(active_playlist_name)
+  if [[ -n $ap ]]; then
+    m=$(jq -r --arg n "$ap" '.playlists[]? | select(.name == $n) | .intervalMinutes // empty' "$user_config" 2>/dev/null)
+    if [[ $m =~ ^[0-9]+$ && $m -ge 1 && $m -le 1440 ]]; then printf '%s' "$m"; return 0; fi
+  fi
+  m=$(cfg '.intervalMinutes' '10')
+  [[ $m =~ ^[0-9]+$ ]] || m=10
+  (( m < 1 )) && m=1
+  (( m > 1440 )) && m=1440
+  printf '%s' "$m"
+}
+
+effective_mode() {
+  local ap m
+  ap=$(active_playlist_name)
+  if [[ -n $ap ]]; then
+    m=$(jq -r --arg n "$ap" '.playlists[]? | select(.name == $n) | .mode // empty' "$user_config" 2>/dev/null)
+    [[ $m == sequential || $m == shuffle ]] && { printf '%s' "$m"; return 0; }
+  fi
+  m=$(cfg '.mode' 'shuffle')
+  [[ $m == sequential ]] && printf 'sequential' || printf 'shuffle'
+}
+
+# current_source_items: playlist items (existing files) or full library
+current_source_items() {
+  local ap f
+  ap=$(active_playlist_name)
+  if [[ -n $ap ]]; then
+    jq -r --arg n "$ap" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" 2>/dev/null \
+      | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u
+  else
+    build_playlist
+  fi
+}
+
+valid_playlist_name() {
+  local n="$1"
+  [[ -n $n ]] || return 1
+  (( ${#n} <= 64 )) || return 1
+  [[ $n == *$'\n'* || $n == *$'\t'* ]] && return 1
+  n=$(printf '%s' "$n" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -n $n ]] || return 1
+  printf '%s' "$n"
+}
+
+save_config_filtered() {
+  # save_config_filtered <jq-filter> [jq-args...] — atomic config rewrite
+  local filter="$1"; shift
+  local tmp
+  tmp=$(mktemp) || return 1
+  if jq "$@" "$filter" "$user_config" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$user_config"
+    chmod 0600 "$user_config" 2>/dev/null || true
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+playlists_json() {
+  local ap
+  ap=$(active_playlist_name)
+  jq --arg ap "$ap" '
+    { active: (if $ap == "" then null else $ap end),
+      playlists: [(.playlists // [])[] | {name, intervalMinutes, mode, count: (.items | length)}] }' "$user_config"
+}
+
+playlist_create() {
+  local name
+  name=$(valid_playlist_name "${1:-}") || { echo "invalid playlist name (1-64 chars)" >&2; return 1; }
+  if jq -e --arg n "$name" '.playlists[]? | select(.name == $n)' "$user_config" >/dev/null 2>&1; then
+    echo "playlist exists: $name" >&2; return 1
+  fi
+  local iv md
+  iv=$(cfg '.intervalMinutes' '10'); md=$(cfg '.mode' 'shuffle')
+  [[ $md == sequential ]] || md="shuffle"
+  save_config_filtered '.playlists = ((.playlists // []) + [{name: $n, intervalMinutes: $iv, mode: $m, items: []}])' \
+    --arg n "$name" --argjson iv "$iv" --arg m "$md" || return 1
+  playlists_json
+}
+
+playlist_delete() {
+  [[ -n ${1:-} ]] || { echo "usage: playlist-delete <name>" >&2; return 1; }
+  save_config_filtered '(.playlists // []) |= map(select(.name != $n)) | if .activePlaylist == $n then .activePlaylist = null else . end' \
+    --arg n "$1" || return 1
+  reset_rotation_state
+  playlists_json
+}
+
+playlist_add() {
+  local name="$1"; shift
+  [[ -n $name ]] || { echo "usage: playlist-add <name> <file...>" >&2; return 1; }
+  jq -e --arg n "$name" '.playlists[]? | select(.name == $n)' "$user_config" >/dev/null 2>&1 \
+    || { echo "no such playlist: $name" >&2; return 1; }
+  local f added=0 tmp_list
+  tmp_list=$(mktemp) || return 1
+  jq -r --arg n "$name" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" >"$tmp_list" 2>/dev/null
+  for f in "$@"; do
+    validate_wallpaper_path "$f" 2>/dev/null || continue
+    grep -Fxq "$f" "$tmp_list" 2>/dev/null && continue
+    printf '%s\n' "$f" >>"$tmp_list"; added=$((added + 1))
+  done
+  if (( added > 0 )); then
+    local items_json
+    items_json=$(jq -R -s '[split("\n")[] | select(length > 0)]' "$tmp_list")
+    save_config_filtered '(.playlists[] | select(.name == $n) | .items) = $items' \
+      --arg n "$name" --argjson items "$items_json" || { rm -f "$tmp_list"; return 1; }
+    reset_rotation_state
+  fi
+  rm -f "$tmp_list"
+  jq -n --argjson added "$added" '{added: $added}'
+}
+
+playlist_remove() {
+  [[ -n ${1:-} && -n ${2:-} ]] || { echo "usage: playlist-remove <name> <file>" >&2; return 1; }
+  save_config_filtered '(.playlists[] | select(.name == $n) | .items) |= map(select(. != $f))' \
+    --arg n "$1" --arg f "$2" || return 1
+  reset_rotation_state
+  playlists_json
+}
+
+playlist_activate() {
+  if [[ ${1:-__all__} == __all__ ]]; then
+    save_config_filtered '.activePlaylist = null' || return 1
+  else
+    jq -e --arg n "$1" '.playlists[]? | select(.name == $n)' "$user_config" >/dev/null 2>&1 \
+      || { echo "no such playlist: $1" >&2; return 1; }
+    save_config_filtered '.activePlaylist = $n' --arg n "$1" || return 1
+  fi
+  reset_rotation_state
+  config_get_json
+}
+
+playlist_set_interval() {
+  [[ -n ${1:-} ]] || { echo "usage: playlist-interval <name> <minutes>" >&2; return 1; }
+  [[ ${2:-} =~ ^[0-9]+$ && $2 -ge 1 && $2 -le 1440 ]] || { echo "interval must be 1-1440" >&2; return 1; }
+  save_config_filtered '(.playlists[] | select(.name == $n) | .intervalMinutes) = $m' \
+    --arg n "$1" --argjson m "$2" || return 1
+  reset_rotation_state
+  config_get_json
+}
+
+playlist_set_mode() {
+  [[ -n ${1:-} ]] || { echo "usage: playlist-mode <name> <shuffle|sequential>" >&2; return 1; }
+  [[ ${2:-} == shuffle || ${2:-} == sequential ]] || { echo "mode must be shuffle|sequential" >&2; return 1; }
+  save_config_filtered '(.playlists[] | select(.name == $n) | .mode) = $m' \
+    --arg n "$1" --arg m "$2" || return 1
+  reset_rotation_state
+  config_get_json
+}
+
+reset_rotation_state() {
+  rm -f "$queue_state"
+  date +%s >"$lastchange_state"
+}
+
 refill_queue() {
   local mode tmp
-  mode=$(cfg '.mode' 'shuffle')
+  mode=$(effective_mode)
   tmp=$(mktemp) || return 1
   if [[ $mode == sequential ]]; then
-    build_playlist >"$tmp"
+    current_source_items >"$tmp"
   else
-    build_playlist | shuf >"$tmp"
+    current_source_items | shuf >"$tmp"
   fi
   # drop current so we don't repeat immediately
   if [[ -s $current_state ]]; then
@@ -444,9 +608,8 @@ advance_if_due() {
       return 1
     fi
   done < <(jq -r '.schedules[]? | [.time, .pick] | @tsv' "$user_config" 2>/dev/null)
-  # 2) interval
-  interval=$(cfg '.intervalMinutes' '10'); [[ $interval =~ ^[0-9]+$ ]] || interval=10
-  (( interval < 1 )) && interval=1
+  # 2) interval (playlist-specific when one is active)
+  interval=$(effective_interval)
   if (( now - last >= interval * 60 )); then
     local next
     if next=$(pop_queue) && [[ -n $next ]]; then
@@ -496,7 +659,7 @@ do_prev() {
 }
 
 do_status() {
-  local cur="" kind="none" active=false paused=false next_in="" queue_len=0 last now interval next_sched=""
+  local cur="" kind="none" active=false paused=false next_in="" queue_len=0 last now interval next_sched="" playlist=""
   [[ -s $current_state ]] && cur=$(<"$current_state")
   if [[ -n $cur ]]; then is_video "$cur" && kind="video" || kind="image"; active=true; fi
   [[ -f $paused_state && $(<"$paused_state") == 1 ]] && paused=true
@@ -505,13 +668,15 @@ do_status() {
   [[ -f $queue_state ]] && queue_len=$(wc -l <"$queue_state" 2>/dev/null || echo 0)
   now=$(date +%s); last=$(cat "$lastchange_state" 2>/dev/null || echo "$now")
   [[ $last =~ ^[0-9]+$ ]] || last=$now
-  interval=$(cfg '.intervalMinutes' '10'); [[ $interval =~ ^[0-9]+$ ]] || interval=10
+  interval=$(effective_interval)
   next_in=$(( interval * 60 - (now - last) ))
   (( next_in < 0 )) && next_in=0
   next_sched=$(jq -r '.schedules[]? | .time' "$user_config" 2>/dev/null | sort | awk -v now="$(date +%H:%M)" '$1 > now {print $1; exit}')
+  playlist=$(active_playlist_name)
   jq -n --arg cur "$cur" --arg kind "$kind" --argjson active "$active" --argjson paused "$paused" \
     --argjson nextIn "$next_in" --argjson queue "$queue_len" --arg sched "$next_sched" \
-    '{active:$active, file:$cur, kind:$kind, paused:$paused, nextInSec:$nextIn, queueLen:$queue, nextSchedule:$sched}'
+    --arg playlist "$playlist" --argjson interval "$interval" \
+    '{active:$active, file:$cur, kind:$kind, paused:$paused, nextInSec:$nextIn, queueLen:$queue, nextSchedule:$sched, playlist:$playlist, intervalMinutes:$interval}'
 }
 
 # ---- online ----
@@ -630,13 +795,21 @@ online_clear() {
 
 # ---- panel backend (JSON for Panel.qml) ----
 grid_local_json() {
-  local limit="${1:-120}" tmp cur
+  local limit="${1:-120}" source="${2:-}" tmp cur list_tmp
   tmp=$(mktemp) || return 1
   # shellcheck disable=SC2064
   trap "rm -f '$tmp'" RETURN
   export cache_dir stock_thumbnail_dir MAX_VIDEO_BYTES
   export -f is_video is_image thumbnail_for_video picker_thumbnail_for_image prewarm_media ensure_secure_dir
-  build_playlist 2>/dev/null | head -n "$limit" | while IFS= read -r f; do prewarm_media "$f"; done >"$tmp" 2>/dev/null
+  if [[ -n $source && $source != __all__ ]]; then
+    list_tmp=$(mktemp) || return 1
+    jq -r --arg n "$source" '.playlists[]? | select(.name == $n) | .items[]?' "$user_config" 2>/dev/null \
+      | while IFS= read -r f; do [[ -f $f ]] && printf '%s\n' "$f"; done | sort -u | head -n "$limit" >"$list_tmp"
+    while IFS= read -r f; do prewarm_media "$f"; done <"$list_tmp" >"$tmp" 2>/dev/null
+    rm -f "$list_tmp"
+  else
+    build_playlist 2>/dev/null | head -n "$limit" | while IFS= read -r f; do prewarm_media "$f"; done >"$tmp" 2>/dev/null
+  fi
   cur=""; [[ -s $current_state ]] && cur=$(<"$current_state")
   jq -R -s --arg cur "$cur" '
     [split("\n")[] | select(length > 0) | split("\t")
@@ -989,8 +1162,11 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh set <file>
   wallpaper-engine.sh interval <min> | enable | disable
   wallpaper-engine.sh search wallhaven|moewalls <query>
-  wallpaper-engine.sh grid-local | grid-search wallhaven|moewalls <query>
+  wallpaper-engine.sh grid-local [limit] [playlist] | grid-search wallhaven|moewalls <query>
   wallpaper-engine.sh apply-key <key> | config-get | config-set <key> <value>
+  wallpaper-engine.sh playlists | playlist-create <n> | playlist-delete <n>
+  wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>
+  wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -1038,7 +1214,15 @@ case "${1:-}" in
     jq -n --argjson bytes "${cur:-0}" --argjson max "${max:-0}" --argjson files "$count" \
       '{cacheBytes:$bytes, maxBytes:$max, files:$files}' ;;
   online-clear) online_clear "${2:-}" ;;
-  grid-local) grid_local_json "${2:-120}" ;;
+  grid-local) grid_local_json "${2:-120}" "${3:-}" ;;
+  playlists) playlists_json ;;
+  playlist-create) playlist_create "${2:-}" ;;
+  playlist-delete) playlist_delete "${2:-}" ;;
+  playlist-add) playlist_add "${2:-}" "${@:3}" ;;
+  playlist-remove) playlist_remove "${2:-}" "${3:-}" ;;
+  playlist-activate) playlist_activate "${2:-__all__}" ;;
+  playlist-interval) playlist_set_interval "${2:-}" "${3:-}" ;;
+  playlist-mode) playlist_set_mode "${2:-}" "${3:-}" ;;
   grid-search)
     case "${2:-}" in
       wallhaven) shift 2; grid_search_json wallhaven "${*:-anime}" ;;

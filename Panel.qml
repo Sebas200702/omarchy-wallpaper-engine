@@ -4,10 +4,9 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
-import qs.Ui
 
-// Wallpaper Engine gallery: browse local + online (Wallhaven/MoeWalls),
-// download & apply, and tune rotation — all in one place.
+// Wallpaper Engine gallery v2: sidebar (library / playlists / online),
+// center grid with search feedback, right properties panel.
 // Summoned with: omarchy-shell shell summon sebas.wallpaper-engine
 Item {
   id: root
@@ -16,16 +15,28 @@ Item {
   property var manifest: null
 
   property bool opened: false
-  property string tab: "local" // local | wallhaven | moewalls | settings
+  // view: {section: "lib" | "playlist" | "online", name: playlistName, provider: wallhaven|moewalls}
+  property var view: ({ section: "lib", name: "", provider: "" })
   property var items: []
-  property string itemsSource: ""
+  property string itemsSource: "" // lib | playlist:<name> | online:<provider>:<query>
   property string query: ""
+  property string filterText: ""
   property bool loading: false
   property string busyText: ""
+  property int busySince: 0
+  property int busyElapsed: 0
   property string notice: ""
   property string errorText: ""
-  property var engine: ({})
+  property var engine: ({ status: ({}), config: ({ intervalMinutes: 10, mode: "shuffle", playlists: [] }) })
   property int serial: 0
+  // selection
+  property string selectedKey: ""
+  property var selectedItem: null
+  property bool selectMode: false
+  property var marked: ({})
+  property int markedCount: 0
+  property string addTarget: ""
+  property string newPlaylistName: ""
 
   readonly property string pluginId: (manifest && manifest.id) || "sebas.wallpaper-engine"
   readonly property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
@@ -35,27 +46,94 @@ Item {
   readonly property color onScrimUrgent: "#ff7b72"
   readonly property color accent: "#7aa2f7"
   readonly property color cardBg: Qt.rgba(0.09, 0.09, 0.11, 0.97)
+  readonly property color rowHover: Qt.rgba(1, 1, 1, 0.07)
   readonly property string fontFamily: Style.font.family
 
-  function providerOf(t) {
-    return t === "wallhaven" || t === "moewalls" ? t : ""
+  function playlists() {
+    var c = root.engine.config || {}
+    return Array.isArray(c.playlists) ? c.playlists : []
+  }
+
+  function activePlaylist() {
+    var c = root.engine.config || {}
+    return c.activePlaylist || ""
+  }
+
+  function viewTitle() {
+    if (root.view.section === "playlist") return root.view.name
+    if (root.view.section === "online")
+      return root.view.provider === "moewalls" ? "Live — MoeWalls" : "Wallhaven"
+    return "Library"
+  }
+
+  function viewSourceTag() {
+    if (root.view.section === "playlist") return "playlist:" + root.view.name
+    if (root.view.section === "online") return "online:" + root.view.provider + ":" + root.query
+    return "lib"
+  }
+
+  function filteredItems() {
+    var needle = root.filterText.trim().toLowerCase()
+    if (needle === "") return root.items
+    var out = []
+    for (var i = 0; i < root.items.length; i++) {
+      var t = String((root.items[i] && root.items[i].title) || "").toLowerCase()
+      if (t.indexOf(needle) !== -1) out.push(root.items[i])
+    }
+    return out
+  }
+
+  // Headless diagnostic: omarchy-shell shell call sebas.wallpaper-engine debugState '{}'
+  function debugState() {
+    var pls = []
+    try {
+      var arr = root.playlists()
+      for (var i = 0; i < arr.length; i++) pls.push(arr[i].name)
+    } catch (e) {}
+    return JSON.stringify({
+      opened: root.opened,
+      view: root.view.section + "/" + (root.view.name || root.view.provider),
+      items: root.items.length,
+      itemsSource: root.itemsSource,
+      loading: root.loading,
+      busy: root.busyText,
+      elapsed: root.busyElapsed,
+      notice: root.notice,
+      error: root.errorText,
+      selected: root.selectedKey,
+      marked: root.markedCount,
+      playlists: pls
+    })
   }
 
   function open(payloadJson) {
+    console.log("WE-PANEL open() called, already opened=" + root.opened)
     root.opened = true
     root.notice = ""
     root.errorText = ""
-    if (root.tab === "settings") loadConfig()
-    else if (root.tab === "local") { if (root.itemsSource !== "local") runGrid() }
-    else { if (root.itemsSource !== root.tab) runSearch(true) }
+    root.selectedKey = ""
+    root.selectedItem = null
+    root.selectMode = false
+    root.marked = ({})
+    root.markedCount = 0
+    // Boot through config first; the grid kicks off when config arrives
+    // (see configProc), so the two requests never race each other.
+    var s = root.startBusy("Loading…")
+    configProc.command = [root.script, "config-get"]
+    configProc.tag = s
+    configProc.mode = "get-boot"
+    configProc.doneNotice = ""
+    configProc.reloadGrid = false
+    configProc.running = true
     Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
   }
 
   function close() {
+    console.log("WE-PANEL close() called")
     root.serial += 1
-    for (var i = 0; i < [gridProc, searchProc, applyProc, configProc].length; i++) {
-      var p = [gridProc, searchProc, applyProc, configProc][i]
-      if (p.running) p.running = false
+    var procs = [gridProc, searchProc, applyProc, configProc]
+    for (var i = 0; i < procs.length; i++) {
+      if (procs[i].running) procs[i].running = false
     }
     root.opened = false
     root.loading = false
@@ -68,101 +146,257 @@ Item {
     else close()
   }
 
-  function switchTab(t) {
-    if (root.tab === t) return
-    root.tab = t
+  function cancelLoad() {
+    root.serial += 1
+    var procs = [gridProc, searchProc, applyProc, configProc]
+    for (var i = 0; i < procs.length; i++) {
+      if (procs[i].running) procs[i].running = false
+    }
+    root.loading = false
+    root.busyText = ""
+    root.notice = "Cancelled"
+  }
+
+  function setView(section, name, provider) {
+    root.view = ({ section: section, name: name || "", provider: provider || "" })
     root.errorText = ""
     root.notice = ""
-    if (t === "settings") { loadConfig(); return }
-    if (t === "local") { if (root.itemsSource !== "local") runGrid(); return }
-    if (root.itemsSource !== t) runSearch(true)
+    root.selectedKey = ""
+    root.selectedItem = null
+    root.selectMode = false
+    root.marked = ({})
+    root.markedCount = 0
+    root.filterText = ""
+    if (section === "online") {
+      if (root.itemsSource !== root.viewSourceTag()) runSearch(true)
+    } else {
+      if (root.itemsSource !== root.viewSourceTag()) runGrid()
+    }
+  }
+
+  function startBusy(text) {
+    var s = ++root.serial
+    root.loading = true
+    root.busyText = text
+    root.errorText = ""
+    root.busySince = Math.floor(Date.now() / 1000)
+    root.busyElapsed = 0
+    return s
   }
 
   function runGrid() {
-    var s = ++root.serial
-    root.loading = true
-    root.busyText = "Loading local wallpapers…"
-    root.errorText = ""
-    gridProc.command = [root.script, "grid-local", "120"]
+    var s = root.startBusy(root.view.section === "playlist"
+      ? "Loading playlist…" : "Loading library…")
+    var src = root.view.section === "playlist" ? root.view.name : ""
+    gridProc.command = [root.script, "grid-local", "150", src]
     gridProc.tag = s
+    gridProc.wantSource = root.viewSourceTag()
     gridProc.running = true
   }
 
   function runSearch(withDefault) {
     var q = root.query.trim()
     if (q === "" && withDefault)
-      q = root.tab === "moewalls" ? "anime" : "landscape"
+      q = root.view.provider === "moewalls" ? "anime" : "landscape"
     if (q === "") { root.errorText = "Type something to search"; return }
     root.query = q
-    var s = ++root.serial
-    root.loading = true
-    root.busyText = "Searching " + root.tab + " for “" + q + "”…"
-    root.errorText = ""
+    var s = root.startBusy("Searching " + root.view.provider + "…")
     root.notice = ""
-    searchProc.command = [root.script, "grid-search", root.tab, q]
+    searchProc.command = [root.script, "grid-search", root.view.provider, q]
     searchProc.tag = s
+    searchProc.wantSource = "online:" + root.view.provider + ":" + q
     searchProc.running = true
   }
 
-  function applyItem(item) {
-    if (!item || root.loading) return
-    var s = ++root.serial
-    root.loading = true
-    root.errorText = ""
-    root.notice = ""
-    if (root.itemsSource === "local") {
-      root.busyText = "Applying “" + (item.title || "wallpaper") + "”…"
-      applyProc.command = [root.script, "set", item.key]
-    } else {
-      root.busyText = "Downloading “" + (item.title || "wallpaper") + "”… (full quality, may take a minute)"
-      applyProc.command = [root.script, "apply-key", item.key]
+  function findItem(key) {
+    for (var i = 0; i < root.items.length; i++) {
+      if (root.items[i] && root.items[i].key === key) return root.items[i]
     }
+    return null
+  }
+
+  function cellClicked(item) {
+    if (!item) return
+    if (root.selectMode) {
+      toggleMark(item.key)
+      return
+    }
+    root.selectedKey = item.key
+    root.selectedItem = item
+  }
+
+  function toggleMark(key) {
+    var next = {}
+    var n = 0
+    for (var k in root.marked) {
+      if (k === key) continue
+      next[k] = true
+      n++
+    }
+    if (n === root.markedCount) {
+      // key was not marked → add it
+      for (var k2 in root.marked) next[k2] = true
+      next[key] = true
+      n = root.markedCount + 1
+    }
+    root.marked = next
+    root.markedCount = n
+    if (root.addTarget === "") {
+      var pls = root.playlists()
+      if (pls.length > 0) root.addTarget = pls[0].name
+    }
+  }
+
+  function cycleAddTarget() {
+    var pls = root.playlists()
+    if (pls.length === 0) return
+    var idx = -1
+    for (var i = 0; i < pls.length; i++) {
+      if (pls[i].name === root.addTarget) { idx = i; break }
+    }
+    root.addTarget = pls[(idx + 1) % pls.length].name
+  }
+
+  function markedKeys() {
+    var out = []
+    for (var k in root.marked) out.push(k)
+    return out
+  }
+
+  function applySelected() {
+    if (!root.selectedItem || root.loading) return
+    var s = root.startBusy(root.view.section === "online" || root.itemsSource.indexOf("online:") === 0
+      ? "Downloading full quality… (up to a minute for video)"
+      : "Applying…")
+    root.notice = ""
+    if (root.itemsSource.indexOf("online:") === 0)
+      applyProc.command = [root.script, "apply-key", root.selectedItem.key]
+    else
+      applyProc.command = [root.script, "set", root.selectedItem.key]
     applyProc.tag = s
-    applyProc.pendingTitle = item.title || "wallpaper"
+    applyProc.pendingTitle = root.selectedItem.title || "wallpaper"
+    applyProc.appliedPath = ""
     applyProc.running = true
   }
 
-  function markCurrent(key) {
-    var next = []
-    for (var i = 0; i < root.items.length; i++) {
-      var it = root.items[i]
-      it.current = (it.key === key)
-      next.push(it)
-    }
-    root.items = next
+  function removeSelected() {
+    if (!root.selectedItem || root.view.section !== "playlist" || root.loading) return
+    mutate(["playlist-remove", root.view.name, root.selectedItem.key], "Removed from " + root.view.name, true)
+  }
+
+  function mutate(args, doneNotice, wantGridReload) {
+    var s = root.startBusy("Saving…")
+    root.notice = ""
+    configProc.command = [root.script].concat(args)
+    configProc.tag = s
+    configProc.mode = "refresh"
+    configProc.doneNotice = doneNotice || ""
+    configProc.reloadGrid = wantGridReload === true
+    configProc.running = true
   }
 
   function loadConfig() {
-    var s = ++root.serial
-    root.loading = true
-    root.busyText = "Loading settings…"
-    root.errorText = ""
+    var s = root.startBusy("Loading…")
     configProc.command = [root.script, "config-get"]
     configProc.tag = s
     configProc.mode = "get"
+    configProc.doneNotice = ""
     configProc.running = true
   }
 
-  function setConfig(key, value) {
+  function loadConfigSilent() {
     var s = ++root.serial
-    root.loading = true
-    root.busyText = "Saving…"
-    root.errorText = ""
+    configProc.command = [root.script, "config-get"]
+    configProc.tag = s
+    configProc.mode = "silent"
+    configProc.doneNotice = ""
+    configProc.running = true
+  }
+
+  function setGlobal(key, value) {
+    var s = root.startBusy("Saving…")
     configProc.command = [root.script, "config-set", key, String(value)]
     configProc.tag = s
-    configProc.mode = "get"
+    configProc.mode = "refresh"
+    configProc.doneNotice = ""
     configProc.running = true
   }
 
-  function engineAction(action) {
-    var s = ++root.serial
-    root.loading = true
-    root.busyText = action === "toggle" ? "Toggling rotation…" : "Switching wallpaper…"
-    root.errorText = ""
-    configProc.command = [root.script, action]
+  function viewingPlaylist() {
+    if (root.view.section !== "playlist") return null
+    var pls = root.playlists()
+    for (var i = 0; i < pls.length; i++) {
+      if (pls[i].name === root.view.name) return pls[i]
+    }
+    return null
+  }
+
+  function contextInterval() {
+    var vp = root.viewingPlaylist()
+    if (vp && vp.intervalMinutes) return vp.intervalMinutes
+    var c = root.engine.config || {}
+    return c.intervalMinutes || 10
+  }
+
+  function stepInterval(delta) {
+    var cur = parseInt(root.contextInterval(), 10) || 10
+    var next = cur + delta
+    if (next < 1) next = 1
+    if (next > 1440) next = 1440
+    var vp = root.viewingPlaylist()
+    if (vp) mutate(["playlist-interval", vp.name, String(next)], "")
+    else setGlobal("interval", String(next))
+  }
+
+  function setMode(mode) {
+    var vp = root.viewingPlaylist()
+    if (vp) mutate(["playlist-mode", vp.name, mode], "")
+    else setGlobal("mode", mode)
+  }
+
+  function createPlaylist() {
+    var n = root.newPlaylistName.trim()
+    if (n === "") { root.errorText = "Name the playlist first"; return }
+    root.newPlaylistName = ""
+    mutate(["playlist-create", n], "Playlist created: " + n)
+  }
+
+  function deleteViewingPlaylist() {
+    if (root.view.section !== "playlist") return
+    var n = root.view.name
+    root.view = ({ section: "lib", name: "", provider: "" })
+    root.itemsSource = ""
+    mutate(["playlist-delete", n], "Playlist deleted", true)
+  }
+
+  function activateViewingPlaylist() {
+    if (root.view.section !== "playlist") return
+    mutate(["playlist-activate", root.view.name], "Rotating: " + root.view.name)
+  }
+
+  function addMarked() {
+    if (root.markedCount === 0 || root.addTarget === "" || root.loading) return
+    var s = root.startBusy("Adding " + root.markedCount + " to " + root.addTarget + "…")
+    configProc.command = [root.script, "playlist-add", root.addTarget].concat(root.markedKeys())
     configProc.tag = s
     configProc.mode = "refresh"
+    configProc.doneNotice = "Added " + root.markedCount + " to " + root.addTarget
+    configProc.reloadGrid = true
+    root.marked = ({})
+    root.markedCount = 0
+    root.selectMode = false
     configProc.running = true
+  }
+
+  function markCurrentFile(path) {
+    if (!path) return
+    var next = []
+    for (var i = 0; i < root.items.length; i++) {
+      var it = root.items[i]
+      if (it) it.current = (it.key === path)
+      next.push(it)
+    }
+    root.items = next
   }
 
   function parseItems(text, source) {
@@ -171,33 +405,25 @@ Item {
     if (!Array.isArray(arr)) arr = []
     root.items = arr
     root.itemsSource = source
+    root.selectedKey = ""
+    root.selectedItem = null
+    root.marked = ({})
+    root.markedCount = 0
+    root.selectMode = false
   }
 
-  component TabButton: Rectangle {
-    id: tabBtn
-    required property string label
-    required property string tabName
-    height: 34
-    width: tabLabel.implicitWidth + 32
-    radius: 8
-    color: root.tab === tabName ? Qt.rgba(1, 1, 1, 0.14) : "transparent"
-    border.width: root.tab === tabName ? 1 : 0
-    border.color: root.accent
-
-    Text {
-      id: tabLabel
-      anchors.centerIn: parent
-      textFormat: Text.PlainText
-      text: tabBtn.label
-      color: root.tab === tabBtn.tabName ? root.onScrim : root.onScrimDim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      font.bold: root.tab === tabBtn.tabName
+  function applyEngineToStatus(d) {
+    if (d && d.config) root.engine = d
+    else if (d && d.status) {
+      var e = root.engine || {}
+      e.status = d.status
+      if (d.config) e.config = d.config
+      root.engine = e
     }
-    MouseArea {
-      anchors.fill: parent
-      cursorShape: Qt.PointingHandCursor
-      onClicked: root.switchTab(tabBtn.tabName)
+    // refresh selected preview flags + sidebar counts flow from engine declaratively
+    if (root.selectedKey !== "") {
+      var it = root.findItem(root.selectedKey)
+      root.selectedItem = it
     }
   }
 
@@ -206,8 +432,8 @@ Item {
     required property string label
     property bool enabled: true
     property bool primary: false
-    height: 36
-    width: Math.max(96, actLabel.implicitWidth + 36)
+    height: 34
+    width: Math.max(70, actLabel.implicitWidth + 28)
     radius: 8
     color: !actBtn.enabled ? Qt.rgba(1, 1, 1, 0.06)
       : actBtn.primary ? root.accent : Qt.rgba(1, 1, 1, 0.12)
@@ -232,46 +458,61 @@ Item {
     }
   }
 
-  component SettingRow: RowLayout {
-    id: setRow
-    required property string label
-    width: parent.width
-    spacing: 12
+  component Stepper: RowLayout {
+    id: stepper
+    required property string valueText
+    signal stepped(int delta)
+    spacing: 6
 
+    ActionButton {
+      label: "−"
+      onClicked: stepper.stepped(-1)
+    }
     Text {
       textFormat: Text.PlainText
-      text: setRow.label
-      color: root.onScrimDim
+      text: stepper.valueText
+      color: root.onScrim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
-      Layout.preferredWidth: 170
+      font.bold: true
+      Layout.preferredWidth: 76
+      horizontalAlignment: Text.AlignHCenter
+    }
+    ActionButton {
+      label: "+"
+      onClicked: stepper.stepped(1)
     }
   }
 
   Process {
     id: gridProc
     property int tag: 0
+    property string wantSource: ""
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         if (gridProc.tag !== root.serial || !root.opened) return
         root.loading = false
         root.busyText = ""
-        var ok = false
-        try {
-          var arr = JSON.parse(String(text || "[]"))
-          ok = Array.isArray(arr)
-        } catch (e) { ok = false }
-        if (ok) root.parseItems(text, "local")
-        else root.errorText = "Could not list local wallpapers"
+        var arr = null
+        try { arr = JSON.parse(String(text || "")) } catch (e) { arr = null }
+        if (Array.isArray(arr)) {
+          root.parseItems(text, gridProc.wantSource)
+          if (arr.length === 0) root.notice = "Empty — add wallpapers to get started"
+          else root.notice = ""
+        } else {
+          root.errorText = "Could not list wallpapers"
+        }
       }
     }
     onExited: function(code) {
       if (gridProc.tag !== root.serial || !root.opened) return
       root.loading = false
-      if (code !== 0 && root.itemsSource !== "local") {
+      if (code !== 0 && root.errorText === "" && root.itemsSource !== gridProc.wantSource) {
         root.busyText = ""
-        if (root.errorText === "") root.errorText = "Could not list local wallpapers"
+        root.errorText = "Could not list wallpapers"
+      } else {
+        root.busyText = ""
       }
     }
   }
@@ -290,13 +531,14 @@ Item {
         try { arr = JSON.parse(String(text || "")) } catch (e) { arr = null }
         if (Array.isArray(arr) && arr.length > 0) {
           root.parseItems(text, searchProc.wantSource)
-          root.notice = arr.length + " results — click one to download & apply"
+          root.notice = arr.length + " results — select one, then Apply"
         } else if (Array.isArray(arr)) {
           root.items = []
           root.itemsSource = searchProc.wantSource
+          root.notice = ""
           root.errorText = "No results. Try another search."
         } else {
-          root.errorText = "Search failed (network or provider changed)"
+          root.errorText = "Search failed — connection issue or provider changed"
         }
       }
     }
@@ -305,8 +547,8 @@ Item {
       root.loading = false
       if (code !== 0 && root.errorText === "" && root.itemsSource !== searchProc.wantSource) {
         root.busyText = ""
-        root.errorText = "Search failed (network or provider changed)"
-      } else if (root.busyText !== "" && root.itemsSource === searchProc.wantSource) {
+        root.errorText = "Search failed — connection issue or provider changed"
+      } else {
         root.busyText = ""
       }
     }
@@ -321,7 +563,8 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         if (applyProc.tag !== root.serial || !root.opened) return
-        applyProc.appliedPath = String(text || "").trim().split("\n").filter(function(l) { return l !== "" }).pop() || ""
+        var lines = String(text || "").trim().split("\n").filter(function(l) { return l !== "" })
+        applyProc.appliedPath = lines.length > 0 ? lines[lines.length - 1] : ""
       }
     }
     onExited: function(code) {
@@ -331,10 +574,8 @@ Item {
       if (code === 0) {
         root.errorText = ""
         root.notice = "Applied: " + applyProc.pendingTitle
-        if (root.itemsSource === "local" && applyProc.appliedPath !== "")
-          root.markCurrent(applyProc.appliedPath)
-        else if (root.itemsSource !== "local")
-          root.itemsSource = root.itemsSource // keep results; local cache refreshes on revisit
+        if (applyProc.appliedPath !== "" && root.view.section !== "online")
+          root.markCurrentFile(applyProc.appliedPath)
         loadConfigSilent()
       } else {
         root.errorText = "Could not apply wallpaper"
@@ -342,43 +583,75 @@ Item {
     }
   }
 
-  function loadConfigSilent() {
-    var s = ++root.serial
-    configProc.command = [root.script, "config-get"]
-    configProc.tag = s
-    configProc.mode = "silent"
-    configProc.running = true
-  }
-
   Process {
     id: configProc
     property int tag: 0
-    property string mode: "get" // get | silent | refresh
+    property string mode: "get" // get | get-boot | silent | refresh
+    property string doneNotice: ""
+    property bool reloadGrid: false
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         if (configProc.tag !== root.serial || !root.opened) return
         if (configProc.mode === "refresh") return
-        try {
-          var d = JSON.parse(String(text || "{}")) || {}
-          if (d.config) root.engine = d
-          else if (d.status) root.engine = { status: d.status, config: root.engine.config || {} }
-        } catch (e) {}
-        if (configProc.mode === "get") {
+        var d = null
+        try { d = JSON.parse(String(text || "")) } catch (e) { d = null }
+        if (d) root.applyEngineToStatus(d.status !== undefined || d.config !== undefined ? d : null)
+        if (d && (d.status !== undefined || d.config !== undefined)) {
+          if (configProc.mode === "get-boot") {
+            // Boot continues into the grid for the current view.
+            if (root.view.section === "online") {
+              if (root.itemsSource !== root.viewSourceTag()) root.runSearch(true)
+              else { root.loading = false; root.busyText = "" }
+            } else {
+              if (root.itemsSource !== root.viewSourceTag()) root.runGrid()
+              else { root.loading = false; root.busyText = "" }
+            }
+            return
+          }
+          if (configProc.mode === "get") {
+            root.loading = false
+            root.busyText = ""
+          }
+        } else if (configProc.mode === "get" || configProc.mode === "get-boot") {
           root.loading = false
           root.busyText = ""
+          if (root.errorText === "") root.errorText = "Could not load settings"
         }
       }
     }
     onExited: function(code) {
       if (configProc.tag !== root.serial || !root.opened) return
       if (configProc.mode === "refresh") {
+        if (code !== 0) {
+          root.loading = false
+          root.busyText = ""
+          if (root.errorText === "") root.errorText = "Could not save — check the name and retry"
+          return
+        }
         configProc.mode = "silent"
         configProc.command = [root.script, "config-get"]
         configProc.running = true
         return
       }
-      if (configProc.mode === "silent") return
+      if (configProc.mode === "silent") {
+        if (configProc.doneNotice !== "") {
+          root.notice = configProc.doneNotice
+          configProc.doneNotice = ""
+        }
+        // keep the "current" marker truthful after rotations
+        if (root.engine.status && root.engine.status.file
+            && root.itemsSource !== "" && root.view.section !== "online")
+          root.markCurrentFile(root.engine.status.file)
+        if (configProc.reloadGrid) {
+          configProc.reloadGrid = false
+          if (root.view.section !== "online" && !root.loading) {
+            root.itemsSource = ""
+            root.runGrid()
+          }
+        }
+        return
+      }
       root.loading = false
       if (code !== 0 && root.errorText === "") {
         root.busyText = ""
@@ -388,8 +661,18 @@ Item {
   }
 
   Timer {
+    id: elapsedTicker
+    interval: 500
+    repeat: true
+    running: root.opened && root.loading
+    onTriggered: {
+      root.busyElapsed = Math.floor(Date.now() / 1000) - root.busySince
+    }
+  }
+
+  Timer {
     id: watchdog
-    interval: 150000
+    interval: 180000
     repeat: false
     running: root.opened && root.loading
     onTriggered: {
@@ -426,8 +709,8 @@ Item {
 
       Item {
         anchors.centerIn: parent
-        width: Math.min(1020, keyCatcher.width - 60)
-        height: Math.min(660, keyCatcher.height - 60)
+        width: Math.min(1180, keyCatcher.width - 48)
+        height: Math.min(700, keyCatcher.height - 48)
 
         MouseArea { anchors.fill: parent; onClicked: {} }
 
@@ -438,352 +721,861 @@ Item {
           border.width: 1
           border.color: Qt.rgba(1, 1, 1, 0.12)
 
-          ColumnLayout {
+          RowLayout {
             anchors.fill: parent
-            anchors.margins: 20
-            spacing: 12
+            spacing: 0
 
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: 12
-
-              Text {
-                textFormat: Text.PlainText
-                text: "WALLPAPER ENGINE"
-                color: root.onScrimDim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 2
-              }
-
-              Text {
-                id: statusLine
-                textFormat: Text.PlainText
-                text: {
-                  var st = (root.engine && root.engine.status) || {}
-                  if (!st.file) return "rotation on • nothing applied yet"
-                  var base = String(st.file).split("/").pop().replace(/\.[^/.]+$/, "")
-                  var mins = Math.floor((st.nextInSec || 0) / 60)
-                  var secs = (st.nextInSec || 0) % 60
-                  return (st.paused ? "paused • " : "next in " + mins + "m " + secs + "s • ") + base
-                }
-                color: root.onScrimFaint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideRight
-                Layout.fillWidth: true
-              }
-
-              ActionButton {
-                label: "Close"
-                Layout.preferredHeight: 32
-                onClicked: root.dismiss()
-              }
-            }
-
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: 8
-
-              TabButton { label: "Local"; tabName: "local" }
-              TabButton { label: "Wallhaven"; tabName: "wallhaven" }
-              TabButton { label: "Live (MoeWalls)"; tabName: "moewalls" }
-              TabButton { label: "Settings"; tabName: "settings" }
-            }
-
-            RowLayout {
-              id: searchRow
-              visible: root.providerOf(root.tab) !== ""
-              Layout.fillWidth: true
-              spacing: 8
+            // ============ SIDEBAR ============
+            Rectangle {
+              Layout.preferredWidth: 232
+              Layout.fillHeight: true
+              color: Qt.rgba(0, 0, 0, 0.25)
+              radius: 14
 
               Rectangle {
-                Layout.fillWidth: true
-                height: 38
-                radius: 8
-                color: Qt.rgba(1, 1, 1, 0.08)
-                border.width: searchInput.activeFocus ? 1 : 0
-                border.color: root.accent
+                // square off the right edge
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                width: 14
+                color: parent.color
+              }
 
-                TextInput {
-                  id: searchInput
-                  anchors.fill: parent
-                  anchors.leftMargin: 12
-                  anchors.rightMargin: 12
-                  verticalAlignment: TextInput.AlignVCenter
-                  color: root.onScrim
-                  selectionColor: root.accent
+              ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 4
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "WALLPAPER ENGINE"
+                  color: root.onScrimDim
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  text: root.query
-                  onTextChanged: root.query = text
-                  Keys.onReturnPressed: root.runSearch(false)
-                  Keys.onEnterPressed: root.runSearch(false)
-                  Keys.onEscapePressed: root.dismiss()
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 2
                 }
 
                 Text {
-                  visible: searchInput.displayText === ""
-                  anchors.left: parent.left
-                  anchors.leftMargin: 12
-                  anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.PlainText
-                  text: root.tab === "moewalls" ? "Search live wallpapers… (e.g. frieren)" : "Search wallpapers… (e.g. mountains)"
+                  text: "LIBRARY"
                   color: root.onScrimFaint
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.topMargin: 10
                 }
-              }
-
-              ActionButton {
-                label: "Search"
-                primary: true
-                enabled: !root.loading
-                onClicked: root.runSearch(false)
-              }
-            }
-
-            // ---- grid view ----
-            Flickable {
-              id: gridScroll
-              visible: root.tab !== "settings"
-              Layout.fillWidth: true
-              Layout.fillHeight: true
-              contentWidth: width
-              contentHeight: gridFlow.height
-              clip: true
-
-              Grid {
-                id: gridFlow
-                width: parent.width
-                columns: 4
-                spacing: 12
 
                 Repeater {
-                  model: root.items
+                  model: [{ label: "All wallpapers", section: "lib", name: "", count: -1 }]
 
-                  Item {
+                  Rectangle {
                     required property var modelData
-                    required property int index
-                    width: (gridFlow.width - 3 * gridFlow.spacing) / 4
-                    height: width * 9 / 16 + 30
+                    Layout.fillWidth: true
+                    height: 36
+                    radius: 8
+                    color: root.view.section === modelData.section && root.view.name === ""
+                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                    border.width: root.view.section === modelData.section && root.view.name === "" ? 1 : 0
+                    border.color: root.accent
 
-                    Rectangle {
+                    Text {
+                      anchors.left: parent.left
+                      anchors.leftMargin: 10
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: modelData.label
+                      color: root.onScrim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+                    MouseArea {
                       anchors.fill: parent
-                      radius: 8
-                      color: Qt.rgba(1, 1, 1, 0.05)
-                      border.width: modelData.current ? 2 : 0
-                      border.color: root.accent
-
-                      Image {
-                        id: cellImg
-                        anchors.top: parent.top
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        height: parent.height - 30
-                        source: modelData.thumb ? "file://" + modelData.thumb : ""
-                        fillMode: Image.PreserveAspectCrop
-                        asynchronous: true
-                        cache: true
-                        smooth: true
-                      }
-
-                      Rectangle {
-                        visible: modelData.kind === "video"
-                        anchors.top: parent.top
-                        anchors.right: parent.right
-                        anchors.margins: 6
-                        width: badgeText.implicitWidth + 14
-                        height: 20
-                        radius: 5
-                        color: Qt.rgba(0, 0, 0, 0.65)
-
-                        Text {
-                          id: badgeText
-                          anchors.centerIn: parent
-                          textFormat: Text.PlainText
-                          text: "LIVE"
-                          color: "white"
-                          font.family: root.fontFamily
-                          font.pixelSize: 10
-                          font.bold: true
-                        }
-                      }
-
-                      Text {
-                        anchors.bottom: parent.bottom
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.leftMargin: 8
-                        anchors.rightMargin: 8
-                        anchors.bottomMargin: 6
-                        textFormat: Text.PlainText
-                        text: (modelData.current ? "● " : "") + (modelData.title || "")
-                        color: modelData.current ? root.accent : root.onScrimDim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        elide: Text.ElideRight
-                      }
-
-                      MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.applyItem(modelData)
-                      }
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.setView(modelData.section, "", "")
                     }
                   }
                 }
-              }
-            }
 
-            Text {
-              visible: root.tab !== "settings" && !root.loading && root.items.length === 0 && root.errorText === ""
-              Layout.fillWidth: true
-              Layout.fillHeight: true
-              textFormat: Text.PlainText
-              text: root.tab === "local" ? "No wallpapers in this theme yet." : "Search to browse wallpapers."
-              color: root.onScrimFaint
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              horizontalAlignment: Text.AlignHCenter
-              verticalAlignment: Text.AlignVCenter
-            }
+                RowLayout {
+                  Layout.fillWidth: true
+                  Layout.topMargin: 10
+                  spacing: 6
 
-            // ---- settings view ----
-            Flickable {
-              visible: root.tab === "settings"
-              Layout.fillWidth: true
-              Layout.fillHeight: true
-              contentWidth: width
-              contentHeight: settingsCol.height
-              clip: true
-
-              ColumnLayout {
-                id: settingsCol
-                width: parent.width
-                spacing: 14
-
-                SettingRow {
-                  label: "Rotation"
-                  ActionButton {
-                    label: (root.engine.config && root.engine.config.enabled === false) || (root.engine.status && root.engine.status.paused) ? "Resume" : "Pause"
-                    onClicked: root.engineAction("toggle")
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "PLAYLISTS"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    Layout.fillWidth: true
                   }
-                  ActionButton { label: "Next"; onClicked: root.engineAction("next") }
-                  ActionButton { label: "Previous"; onClicked: root.engineAction("prev") }
                 }
 
-                SettingRow {
-                  label: "Every (minutes)"
+                Repeater {
+                  model: root.playlists()
+
                   Rectangle {
-                    Layout.preferredWidth: 90
-                    height: 36
+                    required property var modelData
+                    Layout.fillWidth: true
+                    height: 40
+                    radius: 8
+                    color: root.view.section === "playlist" && root.view.name === modelData.name
+                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                    border.width: root.view.section === "playlist" && root.view.name === modelData.name ? 1 : 0
+                    border.color: root.accent
+
+                    ColumnLayout {
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: 10
+                      anchors.rightMargin: 8
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: 0
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: (modelData.name === root.activePlaylist() ? "● " : "") + modelData.name
+                        color: modelData.name === root.activePlaylist() ? root.accent : root.onScrim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: modelData.count + " items · " + modelData.intervalMinutes + "m · " + modelData.mode
+                        color: root.onScrimFaint
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.setView("playlist", modelData.name, "")
+                    }
+                  }
+                }
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: 6
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 34
                     radius: 8
                     color: Qt.rgba(1, 1, 1, 0.08)
 
                     TextInput {
-                      id: intervalInput
+                      id: newPlaylistInput
                       anchors.fill: parent
                       anchors.leftMargin: 10
                       anchors.rightMargin: 10
                       verticalAlignment: TextInput.AlignVCenter
                       color: root.onScrim
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      inputMethodHints: Qt.ImhDigitsOnly
-                      text: (root.engine.config && root.engine.config.intervalMinutes) || ""
+                      font.pixelSize: Style.font.bodySmall
+                      text: root.newPlaylistName
+                      onTextChanged: root.newPlaylistName = text
+                      Keys.onReturnPressed: root.createPlaylist()
+                      Keys.onEnterPressed: root.createPlaylist()
+                    }
+                    Text {
+                      visible: newPlaylistInput.displayText === ""
+                      anchors.left: parent.left
+                      anchors.leftMargin: 10
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "New playlist…"
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
                     }
                   }
                   ActionButton {
-                    label: "Set"
-                    onClicked: root.setConfig("interval", intervalInput.text)
-                  }
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "1 – 1440"
-                    color: root.onScrimFaint
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                  }
-                }
-
-                SettingRow {
-                  label: "Order"
-                  ActionButton {
-                    label: "Shuffle"
-                    primary: !!root.engine.config && root.engine.config.mode !== "sequential"
-                    onClicked: root.setConfig("mode", "shuffle")
-                  }
-                  ActionButton {
-                    label: "Sequential"
-                    primary: !!root.engine.config && root.engine.config.mode === "sequential"
-                    onClicked: root.setConfig("mode", "sequential")
-                  }
-                }
-
-                SettingRow {
-                  label: "Online cache"
-                  Text {
-                    textFormat: Text.PlainText
-                    text: {
-                      var st = (root.engine && root.engine.status) || {}
-                      return "downloads live in the theme's online folder and join rotation"
-                    }
-                    color: root.onScrimFaint
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    wrapMode: Text.Wrap
-                    Layout.fillWidth: true
+                    label: "+"
+                    onClicked: root.createPlaylist()
                   }
                 }
 
                 Text {
                   textFormat: Text.PlainText
-                  text: "Schedules (fixed times) are edited in ~/.config/omarchy/wallpaper-engine.json → \"schedules\": [{\"time\": \"21:00\", \"pick\": \"night.mp4\"}]"
+                  text: "ONLINE"
+                  color: root.onScrimFaint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.topMargin: 10
+                }
+
+                Repeater {
+                  model: [
+                    { label: "Wallhaven", provider: "wallhaven" },
+                    { label: "Live — MoeWalls", provider: "moewalls" }
+                  ]
+
+                  Rectangle {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    height: 36
+                    radius: 8
+                    color: root.view.section === "online" && root.view.provider === modelData.provider
+                      ? Qt.rgba(1, 1, 1, 0.13) : "transparent"
+                    border.width: root.view.section === "online" && root.view.provider === modelData.provider ? 1 : 0
+                    border.color: root.accent
+
+                    Text {
+                      anchors.left: parent.left
+                      anchors.leftMargin: 10
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: modelData.label
+                      color: root.onScrim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.setView("online", "", modelData.provider)
+                    }
+                  }
+                }
+
+                Item { Layout.fillHeight: true }
+
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: {
+                    var st = (root.engine && root.engine.status) || {}
+                    if (!st.file) return "Nothing applied yet"
+                    var base = String(st.file).split("/").pop().replace(/\.[^/.]+$/, "")
+                    var src = st.playlist && st.playlist !== "" ? st.playlist : "Library"
+                    if (st.paused) return "Paused • " + base + "\n" + src
+                    var mins = Math.floor((st.nextInSec || 0) / 60)
+                    var secs = (st.nextInSec || 0) % 60
+                    return base + "\nnext in " + mins + "m " + secs + "s • " + src
+                  }
                   color: root.onScrimFaint
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
-                  wrapMode: Text.Wrap
+                }
+
+                RowLayout {
                   Layout.fillWidth: true
+                  spacing: 6
+                  ActionButton { label: "Next"; onClicked: root.mutate(["next"], "") }
+                  ActionButton {
+                    label: {
+                      var st = (root.engine && root.engine.status) || {}
+                      return st.paused ? "Resume" : "Pause"
+                    }
+                    onClicked: root.mutate(["toggle"], "")
+                  }
                 }
               }
             }
 
-            // ---- footer ----
-            Text {
-              visible: root.loading
+            // ============ CENTER ============
+            ColumnLayout {
               Layout.fillWidth: true
-              textFormat: Text.PlainText
-              text: root.busyText
-              color: root.accent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              horizontalAlignment: Text.AlignHCenter
+              Layout.fillHeight: true
+              Layout.leftMargin: 18
+              Layout.rightMargin: 6
+              Layout.topMargin: 16
+              Layout.bottomMargin: 16
+              spacing: 10
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.viewTitle().toUpperCase()
+                  color: root.onScrim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  Layout.fillWidth: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  visible: root.view.section !== "online"
+                  textFormat: Text.PlainText
+                  text: root.filteredItems().length + " items"
+                  color: root.onScrimFaint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                ActionButton {
+                  visible: root.view.section === "playlist"
+                  label: root.activePlaylist() === root.view.name ? "Active ✓" : "Set active"
+                  enabled: root.activePlaylist() !== root.view.name && !root.loading
+                  onClicked: root.activateViewingPlaylist()
+                }
+                ActionButton {
+                  visible: root.view.section === "playlist"
+                  label: "Delete"
+                  enabled: !root.loading
+                  onClicked: root.deleteViewingPlaylist()
+                }
+                ActionButton {
+                  visible: root.view.section !== "online"
+                  label: root.selectMode ? "Done" : "Select"
+                  onClicked: {
+                    root.selectMode = !root.selectMode
+                    root.marked = ({})
+                    root.markedCount = 0
+                  }
+                }
+              }
+
+              // search (online) / filter (local) row
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Rectangle {
+                  Layout.fillWidth: true
+                  height: 38
+                  radius: 8
+                  color: Qt.rgba(1, 1, 1, 0.08)
+                  border.width: centerInput.activeFocus ? 1 : 0
+                  border.color: root.accent
+
+                  TextInput {
+                    id: centerInput
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 12
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: root.onScrim
+                    selectionColor: root.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    text: root.view.section === "online" ? root.query : root.filterText
+                    onTextChanged: {
+                      if (root.view.section === "online") root.query = text
+                      else root.filterText = text
+                    }
+                    Keys.onReturnPressed: {
+                      if (root.view.section === "online") root.runSearch(false)
+                    }
+                    Keys.onEnterPressed: {
+                      if (root.view.section === "online") root.runSearch(false)
+                    }
+                    Keys.onEscapePressed: root.dismiss()
+                  }
+
+                  Text {
+                    visible: centerInput.displayText === ""
+                    anchors.left: parent.left
+                    anchors.leftMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: root.view.section === "online"
+                      ? (root.view.provider === "moewalls" ? "Search live wallpapers… (e.g. frieren)" : "Search wallpapers… (e.g. mountains)")
+                      : "Filter…"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                }
+
+                ActionButton {
+                  visible: root.view.section === "online"
+                  label: "Search"
+                  primary: true
+                  enabled: !root.loading
+                  onClicked: root.runSearch(false)
+                }
+                ActionButton {
+                  visible: root.view.section !== "online"
+                  label: "Refresh"
+                  enabled: !root.loading
+                  onClicked: {
+                    root.itemsSource = ""
+                    root.runGrid()
+                  }
+                }
+              }
+
+              // selection action bar
+              RowLayout {
+                visible: root.selectMode
+                Layout.fillWidth: true
+                spacing: 8
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.markedCount + " selected"
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  Layout.fillWidth: true
+                }
+                ActionButton {
+                  label: "→ " + (root.addTarget !== "" ? root.addTarget : "playlist")
+                  enabled: root.markedCount > 0 && root.playlists().length > 0 && !root.loading
+                  onClicked: root.cycleAddTarget()
+                }
+                ActionButton {
+                  label: "Add"
+                  primary: true
+                  enabled: root.markedCount > 0 && root.addTarget !== "" && !root.loading
+                  onClicked: root.addMarked()
+                }
+              }
+
+              // progress bar (the visible feedback while busy)
+              ColumnLayout {
+                visible: root.loading
+                Layout.fillWidth: true
+                spacing: 6
+
+                Rectangle {
+                  Layout.fillWidth: true
+                  height: 6
+                  radius: 3
+                  color: Qt.rgba(1, 1, 1, 0.1)
+
+                  Rectangle {
+                    id: progressSlide
+                    width: 120
+                    height: parent.height
+                    radius: 3
+                    color: root.accent
+                  }
+
+                  SequentialAnimation on x {
+                    running: root.loading
+                    loops: Animation.Infinite
+                    NumberAnimation {
+                      from: 0
+                      to: progressTrack.width - progressSlide.width
+                      duration: 1100
+                      easing.type: Easing.InOutSine
+                    }
+                    NumberAnimation {
+                      from: progressTrack.width - progressSlide.width
+                      to: 0
+                      duration: 1100
+                      easing.type: Easing.InOutSine
+                    }
+                  }
+
+                  // anchor target for the animation math
+                  Item { id: progressTrack; anchors.fill: parent }
+                }
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: 8
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.busyText + "  " + root.busyElapsed + "s"
+                    color: root.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                  }
+                  ActionButton {
+                    label: "Cancel"
+                    onClicked: root.cancelLoad()
+                  }
+                }
+              }
+
+              Flickable {
+                id: gridScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                contentWidth: width
+                contentHeight: gridFlow.implicitHeight
+                clip: true
+
+                Grid {
+                  id: gridFlow
+                  width: parent.width
+                  columns: 3
+                  spacing: 12
+
+                  Repeater {
+                    model: root.filteredItems()
+
+                    Item {
+                      required property var modelData
+                      required property int index
+                      width: (gridFlow.width - 2 * gridFlow.spacing) / 3
+                      height: width * 9 / 16 + 32
+
+                      Rectangle {
+                        anchors.fill: parent
+                        radius: 8
+                        color: root.selectedKey === modelData.key
+                          ? Qt.rgba(122, 162, 247, 0.22) : Qt.rgba(1, 1, 1, 0.05)
+                        border.width: (root.selectedKey === modelData.key || modelData.current || root.marked[modelData.key]) ? 2 : 0
+                        border.color: root.marked[modelData.key] ? "#98c379" : root.accent
+
+                        Image {
+                          anchors.top: parent.top
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          height: parent.height - 32
+                          source: modelData.thumb ? "file://" + modelData.thumb : ""
+                          fillMode: Image.PreserveAspectCrop
+                          asynchronous: true
+                          cache: true
+                          smooth: true
+                        }
+
+                        Rectangle {
+                          visible: modelData.kind === "video"
+                          anchors.top: parent.top
+                          anchors.right: parent.right
+                          anchors.margins: 6
+                          width: badgeText.implicitWidth + 14
+                          height: 20
+                          radius: 5
+                          color: Qt.rgba(0, 0, 0, 0.65)
+
+                          Text {
+                            id: badgeText
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: "LIVE"
+                            color: "white"
+                            font.family: root.fontFamily
+                            font.pixelSize: 10
+                            font.bold: true
+                          }
+                        }
+
+                        Rectangle {
+                          visible: root.marked[modelData.key] === true
+                          anchors.top: parent.top
+                          anchors.left: parent.left
+                          anchors.margins: 6
+                          width: 22
+                          height: 22
+                          radius: 11
+                          color: "#98c379"
+
+                          Text {
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: "✓"
+                            color: "#0b0d12"
+                            font.family: root.fontFamily
+                            font.pixelSize: 13
+                            font.bold: true
+                          }
+                        }
+
+                        Rectangle {
+                          visible: root.view.section === "playlist"
+                          anchors.top: parent.top
+                          anchors.left: parent.left
+                          anchors.margins: 6
+                          width: 22
+                          height: 22
+                          radius: 11
+                          color: Qt.rgba(0, 0, 0, 0.65)
+
+                          Text {
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: "×"
+                            color: "white"
+                            font.family: root.fontFamily
+                            font.pixelSize: 14
+                            font.bold: true
+                          }
+
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: function(mouse) {
+                              mouse.accepted = true
+                              root.selectedKey = modelData.key
+                              root.selectedItem = modelData
+                              root.removeSelected()
+                            }
+                          }
+                        }
+
+                        Text {
+                          anchors.bottom: parent.bottom
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.leftMargin: 8
+                          anchors.rightMargin: 8
+                          anchors.bottomMargin: 6
+                          textFormat: Text.PlainText
+                          text: (modelData.current ? "● " : "") + (modelData.title || "")
+                          color: modelData.current ? root.accent : root.onScrimDim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          elide: Text.ElideRight
+                        }
+
+                        MouseArea {
+                          anchors.fill: parent
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.cellClicked(modelData)
+                          onDoubleClicked: {
+                            root.cellClicked(modelData)
+                            root.applySelected()
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              Text {
+                visible: !root.loading && root.filteredItems().length === 0 && root.errorText === ""
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                textFormat: Text.PlainText
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                text: root.view.section === "online"
+                  ? "Search to browse. Results download on Apply."
+                  : (root.view.section === "playlist"
+                    ? "Empty playlist — use Select in Library to add some."
+                    : "No wallpapers here yet.")
+                color: root.onScrimFaint
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                visible: !root.loading && root.notice !== ""
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: root.notice
+                color: root.onScrimDim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+              }
+
+              Text {
+                visible: !root.loading && root.errorText !== ""
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: root.errorText
+                color: root.onScrimUrgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+              }
             }
 
-            Text {
-              visible: !root.loading && root.notice !== ""
-              Layout.fillWidth: true
-              textFormat: Text.PlainText
-              text: root.notice
-              color: root.onScrimDim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              horizontalAlignment: Text.AlignHCenter
-              elide: Text.ElideRight
-            }
+            // ============ PROPERTIES ============
+            Rectangle {
+              Layout.preferredWidth: 272
+              Layout.fillHeight: true
+              color: Qt.rgba(0, 0, 0, 0.25)
 
-            Text {
-              visible: !root.loading && root.errorText !== ""
-              Layout.fillWidth: true
-              textFormat: Text.PlainText
-              text: root.errorText
-              color: root.onScrimUrgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.Wrap
+              Flickable {
+                anchors.fill: parent
+                anchors.margins: 14
+                contentWidth: width
+                contentHeight: propsCol.implicitHeight
+                clip: true
+
+                ColumnLayout {
+                  id: propsCol
+                  width: parent.width
+                  spacing: 10
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "PREVIEW"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 150
+                    radius: 8
+                    color: Qt.rgba(1, 1, 1, 0.05)
+
+                    Image {
+                      anchors.fill: parent
+                      source: root.selectedItem && root.selectedItem.thumb ? "file://" + root.selectedItem.thumb : ""
+                      fillMode: Image.PreserveAspectCrop
+                      asynchronous: true
+                      cache: true
+                      smooth: true
+                    }
+                    Text {
+                      visible: !root.selectedItem
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: "Select a wallpaper"
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    text: root.selectedItem ? (root.selectedItem.title || "") : "—"
+                    color: root.onScrim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: root.selectedItem
+                      ? ((root.selectedItem.kind === "video" ? "Live video" : "Image")
+                        + (root.view.section === "online" ? " • remote — downloads on Apply" : " • local"))
+                      : ""
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  ActionButton {
+                    label: "Apply wallpaper"
+                    primary: true
+                    enabled: root.selectedItem !== null && !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.applySelected()
+                  }
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: Qt.rgba(1, 1, 1, 0.1)
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "ROTATION"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    text: {
+                      var vp = root.viewingPlaylist()
+                      return vp ? ("Playlist: " + vp.name) : "Source: Library (all)"
+                    }
+                    color: root.onScrimDim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Every"
+                      color: root.onScrimDim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                    Stepper {
+                      valueText: root.contextInterval() + " min"
+                      onStepped: function(delta) { root.stepInterval(delta) }
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    ActionButton {
+                      label: "Shuffle"
+                      primary: {
+                        var vp = root.viewingPlaylist()
+                        var m = vp ? vp.mode : ((root.engine.config || {}).mode || "shuffle")
+                        return m !== "sequential"
+                      }
+                      onClicked: root.setMode("shuffle")
+                    }
+                    ActionButton {
+                      label: "Order"
+                      primary: {
+                        var vp2 = root.viewingPlaylist()
+                        var m2 = vp2 ? vp2.mode : ((root.engine.config || {}).mode || "shuffle")
+                        return m2 === "sequential"
+                      }
+                      onClicked: root.setMode("sequential")
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    ActionButton { label: "Prev"; onClicked: root.mutate(["prev"], "") }
+                    ActionButton { label: "Next"; primary: true; onClicked: root.mutate(["next"], "") }
+                    ActionButton {
+                      label: {
+                        var st = (root.engine && root.engine.status) || {}
+                        return st.paused ? "Resume" : "Pause"
+                      }
+                      onClicked: root.mutate(["toggle"], "")
+                    }
+                  }
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: Qt.rgba(1, 1, 1, 0.1)
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    text: "Tip: fixed times go in ~/.config/omarchy/wallpaper-engine.json under \"schedules\"."
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  ActionButton {
+                    label: "Close"
+                    Layout.fillWidth: true
+                    onClicked: root.dismiss()
+                  }
+                }
+              }
             }
           }
         }
