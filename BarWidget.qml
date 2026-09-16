@@ -1,6 +1,7 @@
 import Quickshell
 import Quickshell.Io
 import QtQuick
+import qs.Commons
 import qs.Ui
 
 BarWidget {
@@ -40,14 +41,14 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  WidgetButton {
+  BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
     text: ""
+    slotSize: Style.bar.statusSlot
     active: root.paused
     tooltipText: root.tooltip()
-    horizontalMargin: 7.5
     onPressed: function(btn) {
       if (btn === Qt.RightButton) {
         Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "toggle"])
