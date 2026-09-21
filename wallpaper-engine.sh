@@ -1761,8 +1761,7 @@ case "${1:-}" in
     ;;
   status) do_status ;;
   interval)
-    [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "usage: interval <minutes>" >&2; exit 1; }
-    tmp=$(mktemp) && jq --argjson m "${2}" '.intervalMinutes = $m' "$user_config" >"$tmp" && mv -f "$tmp" "$user_config"
+    config_set_key interval "${2:-}" >/dev/null || exit 1
     date +%s >"$lastchange_state"
     ;;
   enable) tmp=$(mktemp) && jq '.enabled = true' "$user_config" >"$tmp" && mv -f "$tmp" "$user_config"; printf '0' >"$paused_state" 2>/dev/null || true ;;

@@ -4,6 +4,7 @@
   "name": "Wallpaper Engine",
   "version": "0.2.0",
   "author": "sebas",
+  "license": "MIT",
   "description": "Rotating wallpaper engine: local images+videos with timed shuffle, playlists, favorites, schedules, battery/idle-aware playback, and online search (Wallhaven + MoeWalls).",
   "kinds": [
     "service",

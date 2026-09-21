@@ -13,10 +13,8 @@ Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 ## Install
 
 ```bash
-omarchy plugin add <this repo's URL> --enable
+omarchy plugin add https://github.com/Sebas200702/omarchy-wallpaper-engine.git --enable
 ```
-
-(Replace with wherever you publish this — it isn't hosted anywhere yet.)
 
 No extra packages needed beyond Omarchy stock (`ffmpeg`, `curl`, `jq`, `vipsthumbnail`).
 Playback uses QtMultimedia like `tenzin.live-wallpaper` — no extra Quickshell process.

@@ -869,6 +869,7 @@ Item {
           } else {
             root.items = []
             root.itemsSource = searchProc.wantSource
+            root.searchHasMore = false
             root.searchTotal = metaTotal
             root.notice = ""
             root.errorText = "No results. Try another search."
@@ -1014,6 +1015,9 @@ Item {
     repeat: false
     running: root.opened && root.loading
     onTriggered: {
+      gridProc.running = false
+      searchProc.running = false
+      applyProc.running = false
       root.serial += 1
       root.loading = false
       root.busyText = ""

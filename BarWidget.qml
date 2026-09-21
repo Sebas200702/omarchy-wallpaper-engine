@@ -81,7 +81,7 @@ BarWidget {
 
   Process {
     id: statusProc
-    command: [root.script, "status"]
+    command: ["timeout", "10", root.script, "status"]
     stdout: StdioCollector {
       onStreamFinished: {
         try {
