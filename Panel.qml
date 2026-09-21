@@ -117,7 +117,7 @@ Item {
   // Headless diagnostic: omarchy-shell shell call sebas.wallpaper-engine debugState '{}'
   // panelRev lets us verify from the CLI which revision of this file the
   // running shell actually loaded (bump on every Panel.qml change).
-  readonly property string panelRev: "2026-09-21-p21-monitors"
+  readonly property string panelRev: "2026-09-21-p23-uifix2"
   function debugState() {
     var pls = []
     try {
@@ -803,8 +803,11 @@ Item {
     property bool enabled: true
     property bool primary: false
     property bool danger: false
-    height: 34
-    width: Math.max(58, actLabel.implicitWidth + 20)
+    // dense: sidebar rows where three fixed-width buttons share ~208px —
+    // normal padding would overflow the column (measured 270px in 256px).
+    property bool dense: false
+    height: actBtn.dense ? 30 : 34
+    width: Math.max(actBtn.dense ? 44 : 58, actLabel.implicitWidth + (actBtn.dense ? 12 : 20))
     radius: Style.cornerRadius
     color: !actBtn.enabled ? Util.alpha(root.onScrim, 0.06)
       : actBtn.danger ? root.onScrimUrgent
@@ -1308,17 +1311,22 @@ Item {
             spacing: 0
 
             // ============ SIDEBAR ============
+            // 236 logical px: the monitors block needs ~200 for its
+            // [Use current][fit][x] row (fixed-width buttons don't shrink),
+            // center keeps 604 (grid stays 3-col). clip contains any future
+            // fixed-width row instead of painting over the center column.
             Rectangle {
               id: sidePanel
-              Layout.preferredWidth: 200
+              Layout.preferredWidth: 236
               Layout.fillHeight: true
               color: root.insetFill
               radius: Style.cornerRadius
+              clip: true
 
               ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 14
-                spacing: 4
+                spacing: 3
 
                 Text {
                   textFormat: Text.PlainText
@@ -1706,16 +1714,19 @@ Item {
 
                       ActionButton {
                         label: "Use current"
+                        dense: true
                         enabled: !root.loading && !!(root.monitors && root.monitors.globalFile)
                         onClicked: root.monitorAction(["monitor-set", modelData.name, root.monitors.globalFile])
                       }
                       ActionButton {
                         label: modelData.fit || (root.monitors && root.monitors.imageFit) || "crop"
+                        dense: true
                         enabled: !root.loading && !!modelData.file
                         onClicked: root.monitorAction(["monitor-fit", modelData.name, root.cycleFitName(modelData.fit || (root.monitors && root.monitors.imageFit) || "crop")])
                       }
                       ActionButton {
                         label: "✕"
+                        dense: true
                         enabled: !root.loading && !!modelData.file
                         onClicked: root.monitorAction(["monitor-clear", modelData.name])
                       }
@@ -1762,6 +1773,7 @@ Item {
                   }
                   ActionButton {
                     label: (root.monitors && root.monitors.imageFit) || "crop"
+                    dense: true
                     enabled: !root.loading
                     onClicked: root.monitorAction(["config-set", "imageFit", root.cycleFitName((root.monitors && root.monitors.imageFit) || "crop")])
                   }
@@ -2392,16 +2404,29 @@ Item {
               color: root.insetFill
 
               Flickable {
+                id: propsFlick
                 anchors.fill: parent
                 anchors.margins: 14
                 contentWidth: width
                 contentHeight: propsCol.implicitHeight
                 clip: true
 
+                // Wheel scroll for desktop: Flickable drag-scrolls by
+                // default, but a 660px card with a long inspector needs
+                // the wheel too, or the bottom is silently unreachable.
+                WheelHandler {
+                  onWheel: function(e) {
+                    var maxY = Math.max(0, propsFlick.contentHeight - propsFlick.height)
+                    var ny = propsFlick.contentY - e.angleDelta.y
+                    propsFlick.contentY = Math.max(0, Math.min(maxY, ny))
+                    e.accepted = true
+                  }
+                }
+
                 ColumnLayout {
                   id: propsCol
                   width: parent.width
-                  spacing: 10
+                  spacing: 8
 
                   Text {
                     textFormat: Text.PlainText
@@ -2414,7 +2439,7 @@ Item {
 
                   Rectangle {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 150
+                    Layout.preferredHeight: 132
                     radius: Style.cornerRadius
                     color: root.softFill
 
@@ -2452,6 +2477,7 @@ Item {
                   Text {
                     Layout.fillWidth: true
                     textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
                     text: root.selectedItem
                       ? ((root.selectedItem.kind === "video" ? "Live video" : "Image")
                         + (root.view.section === "online" ? " • remote — downloads on Apply" : " • local"))
