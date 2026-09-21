@@ -11,6 +11,9 @@
 #   <a id="moe-download" data-url="<token>"> .. full mp4 token
 # Full file: GET https://go.moewalls.com/download.php?video=<token>
 #   (reversed from custom-wall.js: "https://go.moewalls.com" + "/download.php?video=")
+# Tokens arrive URL-encoded (e.g. %2F) and must be sent verbatim —
+# re-encoding them makes the endpoint answer HTML instead of mp4.
+# No official API — isolated in `providers/moewalls.sh` so breakage doesn't affect local rotation. Verified 2026-09-16.
 # Requires: curl, jq
 # shellcheck disable=SC2155
 
@@ -18,12 +21,23 @@ MOEWALLS_BASE="https://moewalls.com"
 MOEWALLS_DL_BASE="https://go.moewalls.com/download.php?video="
 
 # moewalls_search <query> [per_page] [page] -> TSV: post_id \t title \t page_url
+# Result totals (X-WP-Total / X-WP-TotalPages headers) go to stderr as
+# "META total=<n> pages=<m>" so stdout stays pure TSV.
 moewalls_search() {
-  local query="$1" per_page="${2:-20}" page="${3:-1}" resp
+  local query="$1" per_page="${2:-20}" page="${3:-1}" resp hdr total pages rc
   [[ -n $query ]] || return 1
   [[ $page =~ ^[0-9]+$ && $page -ge 1 ]] || page=1
+  hdr=$(mktemp) || return 1
   resp=$(curl -sS --proto '=https' --max-redirs 3 -m 20 -A "Mozilla/5.0 (X11; Linux x86_64) omarchy-wallpaper-engine/0.1" \
-    "${MOEWALLS_BASE}/wp-json/wp/v2/search?search=$(printf '%s' "$query" | jq -sRr @uri)&per_page=${per_page}&page=${page}&type=post&subtype=post") || return 1
+    -D "$hdr" \
+    "${MOEWALLS_BASE}/wp-json/wp/v2/search?search=$(printf '%s' "$query" | jq -sRr @uri)&per_page=${per_page}&page=${page}&type=post&subtype=post") || rc=$?
+  if [[ ${rc:-0} -ne 0 ]]; then rm -f "$hdr"; return "${rc:-1}"; fi
+  total=$(grep -i '^x-wp-total:' "$hdr" 2>/dev/null | tail -n1 | awk '{print $2}' | tr -d '\r')
+  pages=$(grep -i '^x-wp-totalpages:' "$hdr" 2>/dev/null | tail -n1 | awk '{print $2}' | tr -d '\r')
+  rm -f "$hdr"
+  [[ $total =~ ^[0-9]+$ ]] || total=""
+  [[ $pages =~ ^[0-9]+$ ]] || pages=""
+  [[ -n $total || -n $pages ]] && printf 'META total=%s pages=%s\n' "$total" "$pages" >&2
   printf '%s' "$resp" | jq -r '.[]? | [.id, (.title // ""), (.url // "")] | @tsv' || return 1
 }
 
@@ -45,16 +59,23 @@ moewalls_detail() {
   # the token comes straight out of third-party HTML (data-url="...") and
   # gets interpolated into a download URL below — constrain it to a plain
   # opaque-identifier charset before it ever leaves this function, so a
-  # malformed/hostile page can't inject query params, path segments, or
-  # other URL structure into moewalls_download_url.
-  [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
+  # malformed/hostile page can't inject query params, fragments, or path
+  # segments into moewalls_download_url. Tokens arrive URL-encoded
+  # (e.g. %2F) and are sent verbatim, so % is allowed; raw & ? # / + and
+  # whitespace stay rejected, and splitting happens on raw & before any
+  # %-decoding, so an encoded value can never break out of its parameter.
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=%-]{1,256}$ ]] || return 1
   printf '%s\t%s\t%s\t%s\n' "${thumb:-}" "${preview:-}" "$token" "${title:-}"
 }
 
 moewalls_download_url() {
-  local token="$1" encoded
-  encoded=$(printf '%s' "$token" | jq -sRr @uri) || return 1
-  printf '%s%s' "$MOEWALLS_DL_BASE" "$encoded"
+  local token="$1"
+  # Verbatim passthrough (NOT re-encoded): the server expects the token
+  # exactly as the detail page emitted it — encoding % into %25 makes the
+  # download endpoint answer with an HTML error page instead of the mp4.
+  # Safety comes from the charset check, not from encoding.
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=%-]{1,256}$ ]] || return 1
+  printf '%s%s' "$MOEWALLS_DL_BASE" "$token"
 }
 
 # moewalls_download <token> <dest> <max_bytes> — full mp4 via go.moewalls.com
@@ -64,7 +85,7 @@ moewalls_download() {
   # re-validate at the trust boundary: this function is also reachable
   # directly, and the token may have crossed a state file since detail
   # parsing.
-  [[ -n $token && $token =~ ^[A-Za-z0-9_.=-]{1,256}$ ]] || return 1
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=%-]{1,256}$ ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .moe.XXXXXX) || return 1
   if ! run_curl_killable -sSL --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
       -o "$tmp" "$(moewalls_download_url "$token")"; then

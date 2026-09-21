@@ -50,6 +50,19 @@ call() {
   ' _ "$ENGINE" "$fn" "$@"
 }
 
+call_stdin() {
+  # call_stdin <stdin_file> <testhome> <function> [args...] — like call,
+  # but feeds <stdin_file> to the function's stdin (for stdin filters).
+  local stdin_file="$1" testhome="$2" fn="$3"; shift 3
+  env -i PATH="/usr/bin:/bin" HOME="$testhome" bash -c '
+    scriptpath="$1"; fn="$2"; shift 2
+    args=("$@")
+    set -- --help
+    source "$scriptpath" >/dev/null 2>&1
+    "$fn" "${args[@]}"
+  ' _ "$ENGINE" "$fn" "$@" <"$stdin_file"
+}
+
 call_rc() {
   # same as call, but prints nothing — just returns the function's exit code.
   call "$@" >/dev/null 2>&1
@@ -202,6 +215,95 @@ assert_rc "validate_jsonc: accepts comments + trailing comma (omarchy's own shap
 printf '{\n  "a": 1\n  "b": 2\n}\n' >"$th7/broken.jsonc"
 assert_rc "validate_jsonc: rejects genuinely invalid JSON (missing comma)" \
   1 "$(call_rc "$th7" validate_jsonc "$th7/broken.jsonc"; echo $?)"
+
+# ---- slice_lines ----
+th8=$(new_testhome)
+seq -f 'r%.0f' 1 50 >"$th8/ranks.txt"
+slice_out=$(call_stdin "$th8/ranks.txt" "$th8" slice_lines 21 20)
+assert_eq "slice_lines: window starts at rank 21" \
+  "r21" "$(printf '%s' "$slice_out" | head -n1)"
+assert_eq "slice_lines: window ends at rank 40" \
+  "r40" "$(printf '%s' "$slice_out" | tail -n1)"
+assert_eq "slice_lines: window holds 20 lines" \
+  "20" "$(printf '%s' "$slice_out" | grep -c '')"
+assert_eq "slice_lines: start past EOF yields empty output" \
+  "" "$(call_stdin "$th8/ranks.txt" "$th8" slice_lines 100 20)"
+short_out=$(call_stdin "$th8/ranks.txt" "$th8" slice_lines 46 20)
+assert_eq "slice_lines: short tail is not padded" \
+  "5" "$(printf '%s' "$short_out" | grep -c '')"
+
+# ---- wh_api_pages (20-item UI pages over fixed 24-item API pages) ----
+th9=$(new_testhome)
+assert_eq "wh_api_pages: UI page 1 fits in API page 1" \
+  "1 1 1 20" "$(call "$th9" wh_api_pages 1 20 24)"
+assert_eq "wh_api_pages: UI page 2 straddles API pages 1-2" \
+  "1 2 21 40" "$(call "$th9" wh_api_pages 2 20 24)"
+assert_eq "wh_api_pages: UI page 3 straddles API pages 2-3" \
+  "2 3 41 60" "$(call "$th9" wh_api_pages 3 20 24)"
+assert_eq "wh_api_pages: UI page 6 aligns exactly with API page 5" \
+  "5 5 101 120" "$(call "$th9" wh_api_pages 6 20 24)"
+assert_eq "wh_api_pages: invalid page falls back to page 1" \
+  "1 1 1 20" "$(call "$th9" wh_api_pages 0 20 24)"
+
+# ---- meta_total ----
+th10=$(new_testhome)
+printf 'curl: noise on stderr\nMETA total=137 pages=6\nMETA total=137 pages=6\n' >"$th10/meta.txt"
+assert_eq "meta_total: first META total wins" \
+  "137" "$(call "$th10" meta_total "$th10/meta.txt")"
+printf 'no meta here\n' >"$th10/empty-meta.txt"
+assert_eq "meta_total: missing META yields empty" \
+  "" "$(call "$th10" meta_total "$th10/empty-meta.txt")"
+
+# ---- moe_detail_valid ----
+th11=$(new_testhome)
+assert_rc "moe_detail_valid: well-formed detail line passes" \
+  0 "$(call_rc "$th11" moe_detail_valid "$(printf 't\tp\tabcXYZ_123.-=\ttitle')"; echo $?)"
+assert_rc "moe_detail_valid: hostile token chars fail" \
+  1 "$(call_rc "$th11" moe_detail_valid "$(printf 't\tp\ta&b?c\ttitle')"; echo $?)"
+assert_rc "moe_detail_valid: empty token fails" \
+  1 "$(call_rc "$th11" moe_detail_valid "$(printf 't\tp\t\ttitle')"; echo $?)"
+# Regression: with an empty leading field (missing thumb), IFS-read shifts
+# every field left and would validate the title as the token — cut-based
+# parsing must read the real third field instead.
+assert_rc "moe_detail_valid: empty thumb still validates the real token" \
+  0 "$(call_rc "$th11" moe_detail_valid "$(printf '\tpreview\ttok-1.2=x\ttitle here')"; echo $?)"
+# MoeWalls now emits URL-encoded tokens (e.g. %2F) that must travel
+# verbatim — % passes, but anything that could break out of the download
+# URL's query value still fails.
+assert_rc "moe_detail_valid: URL-encoded token passes" \
+  0 "$(call_rc "$th11" moe_detail_valid "$(printf 't\tp\tWTX7OeKp99iW1QDO9q%%2FyuLe%%2FqZ4g\ttitle')"; echo $?)"
+for bad in 'a&b' 'a?b' 'a#b' 'a/b' 'a b' 'a+b'; do
+  assert_rc "moe_detail_valid: token with '$bad' fails" \
+    1 "$(call_rc "$th11" moe_detail_valid "$(printf 't\tp\t%s\ttitle' "$bad")"; echo $?)"
+done
+
+# ---- emit_search_envelope ----
+th12=$(new_testhome)
+python3 -c "import json; print(json.dumps([{'key': str(i)} for i in range(20)]))" >"$th12/full.json"
+printf '[{"key":"a"},{"key":"b"}]' >"$th12/partial.json"
+env_out=$(call "$th12" emit_search_envelope "$th12/full.json" 1 20 45)
+assert_eq "emit_search_envelope: total passes through" \
+  "45" "$(printf '%s' "$env_out" | jq -r .total)"
+assert_eq "emit_search_envelope: full first page of 45 has more" \
+  "true" "$(printf '%s' "$env_out" | jq -r .hasMore)"
+assert_eq "emit_search_envelope: items preserved" \
+  "20" "$(printf '%s' "$env_out" | jq -r '.items | length')"
+assert_eq "emit_search_envelope: page/pageSize echoed" \
+  "1 20" "$(printf '%s' "$env_out" | jq -r '"\(.page) \(.pageSize)"')"
+env_last=$(call "$th12" emit_search_envelope "$th12/full.json" 3 20 45)
+assert_eq "emit_search_envelope: page ending past total has no more" \
+  "false" "$(printf '%s' "$env_last" | jq -r .hasMore)"
+env_exact=$(call "$th12" emit_search_envelope "$th12/full.json" 1 20 20)
+assert_eq "emit_search_envelope: page ending exactly at total has no more" \
+  "false" "$(printf '%s' "$env_exact" | jq -r .hasMore)"
+env_nototal_full=$(call "$th12" emit_search_envelope "$th12/full.json" 1 20 "")
+assert_eq "emit_search_envelope: unknown total + full page assumes more" \
+  "true" "$(printf '%s' "$env_nototal_full" | jq -r .hasMore)"
+assert_eq "emit_search_envelope: unknown total encodes as null" \
+  "null" "$(printf '%s' "$env_nototal_full" | jq -r .total)"
+env_nototal_short=$(call "$th12" emit_search_envelope "$th12/partial.json" 1 20 "")
+assert_eq "emit_search_envelope: unknown total + short page has no more" \
+  "false" "$(printf '%s' "$env_nototal_short" | jq -r .hasMore)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

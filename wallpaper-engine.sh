@@ -28,7 +28,17 @@ readonly rows_lock="$state_dir/picker.lock"
 readonly MAX_VIDEO_BYTES=524288000
 readonly MAX_ROWS=1200
 readonly MAX_ROW_BYTES=2097152
-readonly ONLINE_PER_PAGE=24
+readonly ONLINE_PER_PAGE=20
+# UI pages served by grid-search (and the panel's "Load more"): 20 items
+# each, with the provider's result total reported alongside so the panel
+# can show "showing X of N" instead of hiding that there is more.
+readonly SEARCH_PAGE_SIZE=20
+# Wallhaven's native API page is fixed at 24 items (no per_page param), so
+# a 20-item UI page usually straddles two API pages — see wh_api_pages.
+readonly WH_API_PAGE_SIZE=24
+# MoeWalls detail pages (one HTTP fetch per result) are cached this long;
+# tokens are re-validated on every cache read (see moe_detail_valid).
+readonly MOE_DETAIL_TTL=86400
 
 # run_curl_killable <curl-arg>... — runs curl in the background and forwards
 # TERM/INT to it, then waits. A plain foreground `curl ...` does NOT get
@@ -825,7 +835,7 @@ online_search_wallhaven() {
     [[ -n $id && -n $full ]] || continue
     (( i++ )); (( i > ONLINE_PER_PAGE )) && break
     title="$id"
-    slug="wh-$(safe_slug "$query")-$id"
+    slug="wh-$(safe_slug "$id")"
     stub="$cache_dir/online/${slug}.jpg"
     if [[ ! -s $stub ]]; then
       curl -sSL --proto '=https' --max-redirs 3 -m 30 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
@@ -853,7 +863,7 @@ online_search_moewalls() {
     IFS=$'\t' read -r thumb preview token dtitle <<<"$detail"
     [[ -n $token ]] || continue
     [[ -n $dtitle ]] && title="$dtitle"
-    slug="moe-$(safe_slug "$title")-$id"
+    slug="moe-$(safe_slug "$id")"
     stub="$cache_dir/online/${slug}.jpg"
     if [[ ! -s $stub ]]; then
       if [[ -n $thumb ]]; then
@@ -1012,6 +1022,133 @@ grid_local_json() {
         favorite: ((.[0] as $k | $favs | index($k)) != null)}]' "$tmp"
 }
 
+# fetch_thumb <url> <dest> — single thumbnail download with a short timeout,
+# atomic via .tmp + mv so parallel xargs workers never leave half-written
+# files behind. Skips when dest already exists (cache hit).
+fetch_thumb() {
+  local url="$1" dest="$2" tmp
+  [[ -n $url && -n $dest ]] || return 1
+  [[ -s $dest ]] && return 0
+  tmp="${dest}.tmp"
+  curl -sSL --proto '=https' --max-redirs 3 -m 12 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  [[ -s $tmp ]] || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$dest"
+}
+
+# fetch_thumb_line <"url<TAB>dest"> — xargs-friendly wrapper around fetch_thumb.
+fetch_thumb_line() {
+  local url dest
+  IFS=$'\t' read -r url dest <<<"$1"
+  fetch_thumb "$url" "$dest"
+}
+
+# fetch_moe_detail_line <"idx<TAB>id<TAB>title<TAB>page_url"> — resolves one
+# MoeWalls result to "$MOE_DET_TMP/$idx" (thumb, preview, token, title TSV).
+# Runs inside xargs workers; MOE_DET_TMP, cache_dir and MOE_DETAIL_TTL must
+# be exported by the caller. Detail HTML is cached per page_url (24h) so
+# repeat searches only cost the cheap WP search call, not one HTTP fetch
+# per result again.
+fetch_moe_detail_line() {
+  local idx _id _title page_url detail ck now mtime cached
+  IFS=$'\t' read -r idx _id _title page_url <<<"$1"
+  [[ -n $page_url ]] || return 1
+  ck="$cache_dir/online/det-$(printf '%s' "$page_url" | md5sum | cut -d' ' -f1).tsv"
+  if [[ -s $ck && ! -L $ck ]]; then
+    now=$(date +%s); mtime=$(stat -Lc '%Y' "$ck" 2>/dev/null || echo 0)
+    [[ $mtime =~ ^[0-9]+$ ]] || mtime=0
+    cached=$(cat "$ck" 2>/dev/null)
+    if (( now - mtime < MOE_DETAIL_TTL )) && moe_detail_valid "$cached"; then
+      printf '%s\n' "$cached" >"$MOE_DET_TMP/$idx"
+      return 0
+    fi
+  fi
+  detail=$(moewalls_detail "$page_url" 2>/dev/null) || return 1
+  moe_detail_valid "$detail" || return 1
+  printf '%s\n' "$detail" >"$MOE_DET_TMP/$idx"
+  printf '%s\n' "$detail" >"${ck}.tmp" 2>/dev/null \
+    && mv -f "${ck}.tmp" "$ck" 2>/dev/null || rm -f "${ck}.tmp" 2>/dev/null
+}
+
+# _kill_tree — best-effort kill of this script's direct children (the
+# parallel curl/xargs phases of a search). The panel kills a search when
+# the user types on, hits Cancel, or switches source; without this the
+# killed script's children keep running until their own timeouts, and
+# rapid successive searches pile up and slow each other down.
+_kill_tree() {
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -TERM -P $$ 2>/dev/null || true
+  else
+    local p
+    for p in $(ps -o pid= --ppid $$ 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
+  fi
+}
+
+# slice_lines <start_1based> <count> — stdin lines → that 1-based window.
+slice_lines() {
+  local start="${1:-1}" count="${2:-20}"
+  [[ $start =~ ^[0-9]+$ && $start -ge 1 ]] || start=1
+  [[ $count =~ ^[0-9]+$ && $count -ge 1 ]] || count=20
+  awk -v a="$start" -v n="$count" 'NR>=a && NR<a+n'
+}
+
+# wh_api_pages <ui_page> <page_size> [api_size] — maps a UI page of
+# <page_size> items onto wallhaven's fixed <api_size>-item API pages.
+# stdout: "k1 k2 abs_start abs_end" (1-based API pages + global ranks).
+wh_api_pages() {
+  local p="${1:-1}" size="${2:-20}" api="${3:-24}" s e k1 k2
+  [[ $p =~ ^[0-9]+$ && $p -ge 1 ]] || p=1
+  [[ $size =~ ^[0-9]+$ && $size -ge 1 ]] || size=20
+  [[ $api =~ ^[0-9]+$ && $api -ge 1 ]] || api=24
+  s=$(( (p-1)*size+1 )); e=$(( p*size ))
+  k1=$(( (s-1)/api+1 )); k2=$(( (e-1)/api+1 ))
+  printf '%s %s %s %s\n' "$k1" "$k2" "$s" "$e"
+}
+
+# meta_total <meta_file> — first "META total=<n> ..." line's <n>, else empty.
+# Both providers print META lines to stderr; callers redirect that to a file.
+meta_total() {
+  sed -n 's/^META total=\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+# moe_detail_valid <tsv_line> — detail line has a usable download token.
+# Same opaque-identifier charset the download path enforces, checked here
+# too so a stale/corrupt cache entry can never sneak a hostile token into
+# a download URL (% allowed: tokens arrive URL-encoded and are sent
+# verbatim; raw & ? # / + and whitespace stay rejected).
+# Parsed with cut (not IFS-read: bash read silently shifts fields left
+# when a leading field is empty, which would validate the wrong field
+# exactly when thumb/preview are missing).
+moe_detail_valid() {
+  local token
+  [[ $(printf '%s' "$1" | awk -F'\t' '{print NF}') -ge 3 ]] || return 1
+  token=$(printf '%s' "$1" | cut -f3)
+  [[ -n $token && $token =~ ^[A-Za-z0-9_.=%-]{1,256}$ ]]
+}
+
+# emit_search_envelope <items_json_file> <page> <page_size> <total_or_empty>
+# — wraps a grid-search items array as
+# {"items":[...],"total":<n|null>,"page":P,"pageSize":S,"hasMore":bool}
+# so the panel can show "showing X of N" and know whether "Load more" has
+# anything left to fetch, instead of discovering it with an empty page.
+emit_search_envelope() {
+  local items_file="$1" page="${2:-1}" size="${3:-20}" total="${4:-}" count end more
+  [[ $page =~ ^[0-9]+$ && $page -ge 1 ]] || page=1
+  [[ $size =~ ^[0-9]+$ && $size -ge 1 ]] || size=20
+  count=$(jq 'length' "$items_file" 2>/dev/null) || return 1
+  [[ $count =~ ^[0-9]+$ ]] || return 1
+  end=$(( (page-1)*size+count ))
+  if [[ $total =~ ^[0-9]+$ ]]; then
+    (( end < total )) && more=true || more=false
+  else
+    (( count >= size )) && more=true || more=false
+  fi
+  jq -n --slurpfile items "$items_file" --argjson page "$page" --argjson size "$size" \
+    --arg total "$total" --argjson more "$more" \
+    '{items: $items[0],
+      total: (if $total == "" then null else ($total | tonumber) end),
+      page: $page, pageSize: $size, hasMore: $more}'
+}
+
 grid_search_json() {
   local provider="$1"; shift
   local page_num=1
@@ -1021,70 +1158,195 @@ grid_search_json() {
     shift
   fi
   local query="${*:-anime}"
-  # Wallhaven's API returns a fixed page size (not adjustable via a
-  # per_page-style param) larger than the old cap=12 — capping below a
-  # full provider page here means each "page" would silently discard
-  # some of it, and paging would skip those discarded items forever.
-  # Match cap to a full page for both providers instead (moewalls_search
-  # is given this same value as its own per_page, so it always returns
-  # up to exactly cap items too — nothing left over to skip).
-  local cap=24 i=0
-  : >"$online_meta"
-  local rows
-  rows=$(mktemp) || return 1
+  # One UI page holds SEARCH_PAGE_SIZE items; moewalls_search takes it as
+  # its own per_page so it returns up to exactly one page. Wallhaven's API
+  # page is fixed at WH_API_PAGE_SIZE (no per_page param), so a UI page
+  # usually straddles two API pages — wh_api_pages maps it and we slice
+  # the exact window, never silently skipping the straddled items.
+  local cap=$SEARCH_PAGE_SIZE
+  # apply-key resolves downloads through online-meta.tsv: a fresh search
+  # (page 1) resets it, deeper pages append — otherwise "Load more" would
+  # orphan every previous page's Apply button.
+  if (( page_num == 1 )); then : >"$online_meta"; else touch "$online_meta"; fi
+  trap '_kill_tree; exit 143' TERM INT
+  local rows items_tmp total=""
+  rows=$(mktemp) || { trap - TERM INT; return 1; }
+  items_tmp=$(mktemp) || { rm -f "$rows"; trap - TERM INT; return 1; }
   # shellcheck disable=SC2064
-  trap "rm -f '$rows'" RETURN
+  trap "rm -f '$rows' '$items_tmp'" RETURN
   if [[ $provider == wallhaven ]]; then
     local categories purity sorting atleast ratios
     categories=$(cfg '.wallhaven.categories' '111'); purity=$(cfg '.wallhaven.purity' '100')
     sorting=$(cfg '.wallhaven.sorting' 'random'); atleast=$(cfg '.wallhaven.atleast' '1920x1080')
     ratios=$(cfg '.wallhaven.ratios' '16x9')
     local id page full thumb slug stub
+    # A typed query with the default "random" sort feels arbitrary — ask the
+    # API for relevance instead, without touching the saved config.
+    if [[ -n ${query// } && $sorting == random ]]; then sorting="relevance"; fi
+    local k1 k2 abs_s abs_e rel_s tsv_tmp sliced_tmp kept_tmp dl_tmp workers meta_tmp ok1
+    read -r k1 k2 abs_s abs_e < <(wh_api_pages "$page_num" "$cap" "$WH_API_PAGE_SIZE")
+    tsv_tmp=$(mktemp) || { trap - TERM INT; return 1; }
+    sliced_tmp=$(mktemp) || { rm -f "$tsv_tmp"; trap - TERM INT; return 1; }
+    kept_tmp=$(mktemp) || { rm -f "$tsv_tmp" "$sliced_tmp"; trap - TERM INT; return 1; }
+    dl_tmp=$(mktemp) || { rm -f "$tsv_tmp" "$sliced_tmp" "$kept_tmp"; trap - TERM INT; return 1; }
+    meta_tmp=$(mktemp) || { rm -f "$tsv_tmp" "$sliced_tmp" "$kept_tmp" "$dl_tmp"; trap - TERM INT; return 1; }
+    # The first API page carries the leading ranks: if it fails, the whole
+    # UI page is unusable (a later page's rows would be misranked). A
+    # failed second page just yields a short page; totals still tell the
+    # panel whether more exists.
+    ok1=0
+    if wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" "$k1" >"$tsv_tmp" 2>"$meta_tmp"; then ok1=1; fi
+    if (( k2 != k1 )); then
+      wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" "$k2" >>"$tsv_tmp" 2>>"$meta_tmp" || true
+    fi
+    if (( ok1 == 0 )); then
+      rm -f "$tsv_tmp" "$sliced_tmp" "$kept_tmp" "$dl_tmp" "$meta_tmp"
+      trap - TERM INT; return 1
+    fi
+    total=$(meta_total "$meta_tmp")
+    rm -f "$meta_tmp"
+    # Slice ranks [abs_s..abs_e] out of the concatenated API TSV (relative
+    # to the first fetched API page), then proceed exactly as before.
+    rel_s=$(( abs_s - (k1-1)*WH_API_PAGE_SIZE ))
+    slice_lines "$rel_s" "$cap" <"$tsv_tmp" >"$sliced_tmp"
+    rm -f "$tsv_tmp"
     while IFS=$'\t' read -r id page full thumb; do
       [[ -n $id && -n $full && -n $thumb ]] || continue
-      (( i++ )); (( i > cap )) && break
-      slug="wh-$(safe_slug "$query")-$id"
+      # Query-independent thumb name (wh-<id>.jpg): the same image found via
+      # different queries hits the cache instead of downloading again.
+      slug="wh-$(safe_slug "$id")"
       stub="$cache_dir/online/${slug}.jpg"
-      if [[ ! -s $stub ]]; then
-        curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "omarchy-wallpaper-engine/0.1" -o "$stub.tmp" "$thumb" 2>/dev/null \
-          && mv -f "$stub.tmp" "$stub" || continue
-      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "$page" "$full" "$id" "$thumb" >>"$kept_tmp"
+      [[ -s $stub ]] || printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
+    done <"$sliced_tmp"
+    rm -f "$sliced_tmp"
+    if [[ -s $dl_tmp ]]; then
+      workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
+      export -f fetch_thumb fetch_thumb_line
+      timeout 60 xargs -a "$dl_tmp" -d '\n' -r -n 1 -P "$workers" bash -c 'fetch_thumb_line "$1"' _ 2>/dev/null || true
+    fi
+    rm -f "$dl_tmp"
+    while IFS=$'\t' read -r stub page full id thumb; do
+      [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "image" "$page" "$id" "$id" >>"$rows"
       printf '%s\twallhaven\t%s\t%s\t%s\n' "$stub" "$full" "$page" "$id" >>"$online_meta"
-    done < <(wallhaven_search "$query" "$categories" "$purity" "$sorting" "$atleast" "$ratios" "$page_num")
+    done <"$kept_tmp"
+    rm -f "$kept_tmp"
   elif [[ $provider == moewalls ]]; then
     local id title page_url thumb preview token dtitle slug stub detail
+    local api_tmp numbered_tmp det_tmp dl_tmp workers idx meta_tmp api_ok
+    api_tmp=$(mktemp) || { trap - TERM INT; return 1; }
+    numbered_tmp=$(mktemp) || { rm -f "$api_tmp"; trap - TERM INT; return 1; }
+    meta_tmp=$(mktemp) || { rm -f "$api_tmp" "$numbered_tmp"; trap - TERM INT; return 1; }
+    api_ok=1
+    moewalls_search "$query" "$cap" "$page_num" >"$api_tmp" 2>"$meta_tmp" || api_ok=0
+    total=$(meta_total "$meta_tmp")
+    rm -f "$meta_tmp"
+    # API failure (not "zero matches") keeps the old contract: no stdout, rc 1.
+    if (( api_ok == 0 )); then rm -f "$api_tmp" "$numbered_tmp"; trap - TERM INT; return 1; fi
+    idx=0
     while IFS=$'\t' read -r id title page_url; do
       [[ -n $page_url ]] || continue
-      (( i++ )); (( i > cap )) && break
-      detail=$(moewalls_detail "$page_url" 2>/dev/null) || continue
-      IFS=$'\t' read -r thumb preview token dtitle <<<"$detail"
+      (( idx++ )); (( idx > cap )) && break
+      printf '%s\t%s\t%s\t%s\n' "$idx" "$id" "$title" "$page_url" >>"$numbered_tmp"
+    done <"$api_tmp"
+    rm -f "$api_tmp"
+    if [[ ! -s $numbered_tmp ]]; then
+      # Valid response, zero matches → empty page (rc 0), so the panel can
+      # say "No results" instead of reporting a connection failure.
+      rm -f "$numbered_tmp"
+      printf '[]\n' >"$items_tmp"
+      trap - TERM INT
+      emit_search_envelope "$items_tmp" "$page_num" "$cap" "$total" || printf '[]\n'
+      return 0
+    fi
+    # Detail pages (one HTTP fetch per result — the slow part) resolve in
+    # parallel into indexed files, preserving result order for ranking.
+    det_tmp=$(mktemp -d) || { rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
+    export MOEWALLS_BASE MOEWALLS_DL_BASE
+    export MOE_DET_TMP="$det_tmp"
+    export cache_dir MOE_DETAIL_TTL
+    export -f moewalls_detail moe_detail_valid fetch_moe_detail_line
+    timeout 120 xargs -a "$numbered_tmp" -d '\n' -r -n 1 -P "$workers" bash -c 'fetch_moe_detail_line "$1"' _ 2>/dev/null || true
+    unset MOE_DET_TMP
+    # Thumbnails for resolved items download in parallel too; items whose
+    # thumb is still missing afterwards fall back to a preview-webm frame.
+    dl_tmp=$(mktemp) || { rm -rf "$det_tmp"; rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    export -f fetch_thumb fetch_thumb_line
+    while IFS=$'\t' read -r idx id title page_url; do
+      [[ -f $det_tmp/$idx ]] || continue
+      # cut, not IFS-read: a missing thumb/preview (empty leading field)
+      # would otherwise shift token into the wrong variable (see
+      # moe_detail_valid). Tabs inside titles are flattened so later
+      # tab-splitting stages never misalign.
+      thumb=$(cut -f1 <"$det_tmp/$idx")
+      preview=$(cut -f2 <"$det_tmp/$idx")
+      token=$(cut -f3 <"$det_tmp/$idx")
+      dtitle=$(cut -f4- <"$det_tmp/$idx")
       [[ -n $token ]] || continue
       [[ -n $dtitle ]] && title="$dtitle"
-      slug="moe-$(safe_slug "$title")-$id"
+      title=${title//$'\t'/ }
+      # Query-independent thumb name (moe-<id>.jpg): same cache-hit rationale
+      # as wallhaven above; the title stays in rows/meta, not the filename.
+      slug="moe-$(safe_slug "$id")"
       stub="$cache_dir/online/${slug}.jpg"
-      if [[ ! -s $stub ]]; then
-        if [[ -n $thumb ]]; then
-          curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0" -o "$stub.tmp" "$thumb" 2>/dev/null && mv -f "$stub.tmp" "$stub" || continue
-        elif [[ -n $preview ]]; then
-          curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0" -o "$cache_dir/online/${slug}.webm" "$preview" 2>/dev/null || continue
-          timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "$cache_dir/online/${slug}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue
-        else
-          continue
-        fi
+      if [[ ! -s $stub && -n $thumb ]]; then
+        printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
       fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "$token" "${preview:-}" >>"$numbered_tmp.done"
+    done <"$numbered_tmp"
+    rm -f "$numbered_tmp"
+    if [[ -s $dl_tmp ]]; then
+      timeout 60 xargs -a "$dl_tmp" -d '\n' -r -n 1 -P "$workers" bash -c 'fetch_thumb_line "$1"' _ 2>/dev/null || true
+    fi
+    rm -f "$dl_tmp"
+    while IFS=$'\t' read -r idx stub page_url title id token preview; do
+      if [[ ! -s $stub && -n $preview ]]; then
+        # fallback: frame from preview webm (kept sequential: rare path that
+        # needs ffmpeg, and the file is only ~2MB)
+        if [[ $preview == /* ]]; then preview="${MOEWALLS_BASE}${preview}"; fi
+        case "$preview" in
+          https://moewalls.com/*)
+            curl -sSL --proto '=https' --max-redirs 3 -m 25 -A "Mozilla/5.0" -o "${stub%.jpg}.webm" "$preview" 2>/dev/null || continue
+            timeout 12 ffmpeg -nostdin -hide_banner -loglevel error -i "${stub%.jpg}.webm" -frames:v 1 -q:v 3 -y "$stub" 2>/dev/null || continue ;;
+          *) continue ;;
+        esac
+      fi
+      [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" >>"$rows"
       printf '%s\tmoewalls\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" >>"$online_meta"
-    done < <(moewalls_search "$query" "$cap" "$page_num")
+    done <"$numbered_tmp.done"
+    rm -f "$numbered_tmp.done"
+    rm -rf "$det_tmp"
   else
+    trap - TERM INT
     return 1
   fi
-  jq -R -s '
-    [split("\n")[] | select(length > 0) | split("\t")
-     | select(length >= 5)
-     | {key: .[0], kind: .[1], page: .[2],
-        title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
-        thumb: .[0]}]' "$rows"
+  if [[ $provider == moewalls ]]; then
+    # Rank by query-word overlap in the title: the provider's own search is
+    # loose (substring over post content), so exact title matches float up
+    # instead of drowning between loosely related posts.
+    jq -R -s --arg q "$query" '
+      ($q | ascii_downcase | split(" ") | map(select(length > 0))) as $words
+      | [split("\n")[] | select(length > 0) | split("\t")
+       | select(length >= 5)
+       | {key: .[0], kind: .[1], page: .[2],
+          title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
+          thumb: .[0]}
+       | (.title | ascii_downcase) as $tl
+       | . + {score: ([$words[] | select(. as $w | $tl | contains($w))] | length)}]
+      | sort_by(-.score) | map(del(.score))' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
+  else
+    jq -R -s '
+      [split("\n")[] | select(length > 0) | split("\t")
+       | select(length >= 5)
+       | {key: .[0], kind: .[1], page: .[2],
+          title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
+          thumb: .[0]}]' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
+  fi
+  trap - TERM INT
+  emit_search_envelope "$items_tmp" "$page_num" "$cap" "$total" || cat "$items_tmp"
 }
 
 config_get_json() {
@@ -1104,7 +1366,7 @@ config_set_key() {
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
-    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle)
+    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle|muteVideos)
       [[ $val == true || $val == false ]] || { echo "$key must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" --arg k "$key" '.[$k] = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     transitionMs)
@@ -1461,7 +1723,10 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh set <file>
   wallpaper-engine.sh interval <min> | enable | disable
   wallpaper-engine.sh search wallhaven|moewalls <query>
-  wallpaper-engine.sh grid-local [limit] [playlist] | grid-search wallhaven|moewalls <query>
+  wallpaper-engine.sh grid-local [limit] [playlist] | grid-search wallhaven|moewalls [--page=N] <query>
+    # grid-search serves 20-item pages (Wallhaven's fixed 24-item API pages
+    # are windowed, nothing skipped) as {"items":[...],"total":n|null,
+    # "page":N,"pageSize":20,"hasMore":bool}; rc 1 + no stdout on failure.
   wallpaper-engine.sh apply-key <key> | config-get | config-set <key> <value>
   wallpaper-engine.sh playlists | playlist-create <n> | playlist-delete <n>
   wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>

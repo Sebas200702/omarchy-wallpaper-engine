@@ -6,7 +6,7 @@ Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 - **Playlists + Favorites**: named playlists with their own interval/mode, plus a flat favorites star available from any view
 - **Schedules**: fixed `HH:MM` slots that force a specific file (e.g. night video at 21:00), managed from the CLI or the panel sidebar
 - **Battery/idle-aware playback**: video decoding pauses on battery and after a period of inactivity, resumes instantly
-- **Online search**: Wallhaven (images, official API, filters exposed in the panel) + MoeWalls (live videos, via WP search + direct download) from the same gallery, with pagination ("Load more") and per-item attribution
+- **Online search**: Wallhaven (images, official API, filters exposed in the panel) + MoeWalls (live videos, via WP search + direct download) from the same gallery, in 20-item pages with result totals ("showing X of N", "More (X of N)") and per-item attribution. Entering a source starts with an empty search — no default query, results reset on every source switch.
 - **Panel gallery**: keyboard-navigable grid (arrows + Enter), delete-from-disk with inline confirm, favorite toggle per cell
 - **CLI + bar widget**: `next / prev / toggle / status / interval / search / delete-file / favorite-toggle / schedule-add …`
 
@@ -57,14 +57,20 @@ Config lives in `~/.config/omarchy/wallpaper-engine.json` (created on first run 
 
 A video wallpaper only decodes while it can actually be seen:
 
-- `pauseOnBattery` (default `true`): pause while on battery power.
+- `pauseOnBattery` (default `false`): pause while on battery power.
 - `pauseWhenIdle` (default `true`): pause after `idlePauseSeconds` (default
   `120`) of no keyboard/mouse activity — covers "away from the desk" and
   "screen locked", since both stop input.
+- `muteVideos` (default `true`): videos play silent. Unmute from the panel's
+  PLAYBACK section if you want sound (one player per screen, so unmuted
+  audio stacks on multi-monitor).
 
 This only pauses/resumes the video player; rotation and the engine's own
-pause (bar widget, `toggle`) are unaffected. Changes to these three keys
-take effect live (no restart needed).
+pause (bar widget, `toggle`) are unaffected. The bar tooltip tells them
+apart: `(paused)` is your manual rotation pause, `video paused — on
+battery / idle` is the automatic player freeze. Changes to these keys
+take effect live (no restart needed), and the panel's PLAYBACK section
+edits them without touching JSON.
 
 ### CLI
 
@@ -97,7 +103,7 @@ Online (native picker; the panel's own search UI calls `grid-search`/`apply-key`
 ```bash
 wallpaper-engine.sh search wallhaven "anime sunset"     # browse + pick, downloads to theme folder
 wallpaper-engine.sh search moewalls "frieren"           # browse live videos, pick downloads full mp4
-wallpaper-engine.sh grid-search wallhaven --page=2 "sunset"   # pagination, used by the panel's "Load more"
+wallpaper-engine.sh grid-search wallhaven --page=2 "sunset"   # 20-item pages as {items,total,page,pageSize,hasMore}
 wallpaper-engine.sh online-status
 wallpaper-engine.sh online-clear                        # prune download cache
 ```
@@ -105,7 +111,9 @@ wallpaper-engine.sh online-clear                        # prune download cache
 ### Bar widget
 
 Add **Wallpaper Engine** to the bar: left-click = open the panel gallery, right-click = next wallpaper, middle-click = pause/resume.
-Tooltip shows current file + time to next rotation.
+Tooltip shows current file + time to next rotation + automatic video-freeze
+reason (`video paused — on battery / idle`) when the player — not the
+rotation — is paused.
 
 ### Panel gallery
 
@@ -116,7 +124,14 @@ Summon with the bar widget or `omarchy-shell shell summon sebas.wallpaper-engine
 - **Star** on every cell (or the Favorite button) toggles favorites; **×** removes an item from the playlist you're viewing.
 - **Delete from disk**: two-step inline confirm (click once to arm, again to confirm) — permanently removes the file, drops it from any playlist/favorites, and advances rotation if it was the current wallpaper.
 - **Attribution**: a downloaded online wallpaper shows its source (Wallhaven/MoeWalls) and the artist's page.
-- **Online search**: Wallhaven filters (purity, sorting, minimum resolution, categories) are editable right there; "Load more" paginates both providers.
+- **Online search**: Wallhaven filters (purity, sorting, minimum resolution, categories) are editable right there; results load in 20-item pages ("More (X of N)" while more exists).
+  Typing in an online view searches live (700ms debounce; clearing the box
+  clears the results, stale searches are killed together with their
+  background downloads); thumbnail/detail fetches run up to 6-way parallel
+  with a shared thumbnail cache plus a 24h MoeWalls detail cache, so repeat
+  searches are near-instant. Typed Wallhaven queries use relevance order
+  even when the saved sort is `random`;
+  MoeWalls results rank exact title matches first.
 - **Schedules**: add/remove `HH:MM` slots from the sidebar without touching the config file.
 
 ## How online works

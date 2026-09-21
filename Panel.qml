@@ -23,6 +23,7 @@ Item {
   property string filterText: ""
   property int searchPage: 1
   property bool searchHasMore: true
+  property int searchTotal: -1 // provider result total, -1 when unknown
   property bool loading: false
   property string busyText: ""
   property int busySince: 0
@@ -103,6 +104,9 @@ Item {
   }
 
   // Headless diagnostic: omarchy-shell shell call sebas.wallpaper-engine debugState '{}'
+  // panelRev lets us verify from the CLI which revision of this file the
+  // running shell actually loaded (bump on every Panel.qml change).
+  readonly property string panelRev: "2026-09-20-p20-envelope"
   function debugState() {
     var pls = []
     try {
@@ -110,6 +114,7 @@ Item {
       for (var i = 0; i < arr.length; i++) pls.push(arr[i].name)
     } catch (e) {}
     return JSON.stringify({
+      rev: root.panelRev,
       opened: root.opened,
       view: root.view.section + "/" + (root.view.name || root.view.provider),
       items: root.items.length,
@@ -189,6 +194,18 @@ Item {
   }
 
   function setView(section, name, provider) {
+    // Switching source always starts from a clean slate: kill anything
+    // in flight (its serial-guarded callbacks become no-ops), clear the
+    // query + results, and never fire a default search — the grid stays
+    // on its empty-state hint until the user types something.
+    root.serial += 1
+    var procs = [gridProc, searchProc, applyProc]
+    for (var i = 0; i < procs.length; i++) {
+      if (procs[i].running) procs[i].running = false
+    }
+    if (configProc.running) configProc.tag = root.serial
+    root.loading = false
+    root.busyText = ""
     root.view = ({ section: section, name: name || "", provider: provider || "" })
     root.errorText = ""
     root.notice = ""
@@ -198,12 +215,14 @@ Item {
     root.marked = ({})
     root.markedCount = 0
     root.filterText = ""
+    root.query = ""
     root.confirmDeleteKey = ""
-    if (section === "online") {
-      if (root.itemsSource !== root.viewSourceTag()) runSearch(true)
-    } else {
-      if (root.itemsSource !== root.viewSourceTag()) runGrid()
-    }
+    root.items = []
+    root.itemsSource = ""
+    root.searchPage = 1
+    root.searchHasMore = true
+    root.searchTotal = -1
+    if (section !== "online") runGrid()
   }
 
   function startBusy(text) {
@@ -228,14 +247,33 @@ Item {
     gridProc.running = true
   }
 
-  function runSearch(withDefault) {
+  // Online search never invents a query: an empty box clears the results
+  // (back to the empty-state hint) instead of searching a default.
+  function runSearch() {
     var q = root.query.trim()
-    if (q === "" && withDefault)
-      q = root.view.provider === "moewalls" ? "anime" : "landscape"
-    if (q === "") { root.errorText = "Type something to search"; return }
+    if (q === "") {
+      root.serial += 1
+      if (searchProc.running) searchProc.running = false
+      root.loading = false
+      root.busyText = ""
+      root.items = []
+      root.itemsSource = ""
+      root.searchPage = 1
+      root.searchHasMore = true
+      root.searchTotal = -1
+      root.notice = ""
+      root.errorText = ""
+      return
+    }
     root.query = q
     root.searchPage = 1
     root.searchHasMore = true
+    root.searchTotal = -1
+    // Kill a still-running search before starting the new one so rapid
+    // successive searches (debounce typing, page flips) can't pile up
+    // background curl/ffprobe work — the serial tag already discards the
+    // stale result, this also stops its network/CPU cost.
+    if (searchProc.running) searchProc.running = false
     var s = root.startBusy("Searching " + root.view.provider + "…")
     root.notice = ""
     searchProc.command = [root.script, "grid-search", root.view.provider, q]
@@ -451,6 +489,39 @@ Item {
     configProc.mode = "refresh"
     configProc.doneNotice = ""
     configProc.running = true
+  }
+
+  // ---- Playback settings (config-backed, wallpaper-engine.sh validates) ----
+  // Defaults mirror Service.qml initial properties: battery=false (videos
+  // keep playing unplugged), idle=true + 120s, videos muted.
+  function playbackCfg() {
+    var c = root.engine.config || {}
+    return {
+      pauseOnBattery: c.pauseOnBattery === true,
+      pauseWhenIdle: c.pauseWhenIdle !== false,
+      idleSecs: (c.idlePauseSeconds >= 10) ? c.idlePauseSeconds : 120,
+      muted: c.muteVideos !== false
+    }
+  }
+
+  function togglePauseOnBattery() {
+    root.setGlobal("pauseOnBattery", String(!root.playbackCfg().pauseOnBattery))
+  }
+
+  function togglePauseWhenIdle() {
+    root.setGlobal("pauseWhenIdle", String(!root.playbackCfg().pauseWhenIdle))
+  }
+
+  function stepIdleSeconds(delta) {
+    var cur = parseInt(root.playbackCfg().idleSecs, 10) || 120
+    var next = cur + delta * 30
+    if (next < 10) next = 10
+    if (next > 3600) next = 3600
+    root.setGlobal("idlePauseSeconds", String(next))
+  }
+
+  function toggleMute() {
+    root.setGlobal("muteVideos", String(!root.playbackCfg().muted))
   }
 
   // ---- Wallhaven filters (config-backed, wallpaper-engine.sh validates) ----
@@ -743,9 +814,21 @@ Item {
         if (searchProc.tag !== root.serial || !root.opened) return
         root.loading = false
         root.busyText = ""
+        var payload = null
+        try { payload = JSON.parse(String(text || "")) } catch (e) { payload = null }
+        // Backend envelope: {items, total, page, pageSize, hasMore}. A bare
+        // array is still accepted (older backend / fallback path).
         var arr = null
-        try { arr = JSON.parse(String(text || "")) } catch (e) { arr = null }
-        if (Array.isArray(arr) && arr.length > 0) {
+        var metaTotal = -1
+        var metaHasMore = null
+        if (Array.isArray(payload)) {
+          arr = payload
+        } else if (payload && Array.isArray(payload.items)) {
+          arr = payload.items
+          if (typeof payload.total === "number" && payload.total >= 0) metaTotal = payload.total
+          if (typeof payload.hasMore === "boolean") metaHasMore = payload.hasMore
+        }
+        if (arr !== null && arr.length > 0) {
           if (searchProc.append && root.itemsSource === searchProc.wantSource) {
             var seen = {}
             var i
@@ -758,20 +841,35 @@ Item {
             root.items = merged
             root.searchPage = searchProc.pendingPage
             if (added === 0) root.searchHasMore = false
-            root.notice = merged.length + " results — select one, then Apply"
+            else if (metaHasMore !== null) root.searchHasMore = metaHasMore
+            if (metaTotal >= 0) {
+              root.searchTotal = metaTotal
+              root.notice = merged.length + " of " + metaTotal + " shown — select one, then Apply"
+            } else {
+              root.searchTotal = -1
+              root.notice = merged.length + " results — select one, then Apply"
+            }
           } else {
-            root.parseItems(text, searchProc.wantSource)
+            root.parseItems(JSON.stringify(arr), searchProc.wantSource)
             root.searchPage = 1
-            root.searchHasMore = true
-            root.notice = arr.length + " results — select one, then Apply"
+            if (metaHasMore !== null) root.searchHasMore = metaHasMore
+            else root.searchHasMore = true
+            if (metaTotal >= 0) {
+              root.searchTotal = metaTotal
+              root.notice = arr.length + " of " + metaTotal + " — select one, then Apply"
+            } else {
+              root.searchTotal = -1
+              root.notice = arr.length + " results — select one, then Apply"
+            }
           }
-        } else if (Array.isArray(arr)) {
+        } else if (arr !== null) {
           if (searchProc.append) {
             root.searchHasMore = false
-            root.notice = root.items.length + " results — no more"
+            root.notice = root.items.length + " shown — no more"
           } else {
             root.items = []
             root.itemsSource = searchProc.wantSource
+            root.searchTotal = metaTotal
             root.notice = ""
             root.errorText = "No results. Try another search."
           }
@@ -837,10 +935,12 @@ Item {
         if (d) root.applyEngineToStatus(d.status !== undefined || d.config !== undefined ? d : null)
         if (d && (d.status !== undefined || d.config !== undefined)) {
           if (configProc.mode === "get-boot") {
-            // Boot continues into the grid for the current view.
+            // Boot continues into the grid for the current view — except
+            // online views, which deliberately start empty (no default
+            // search) until the user types something.
             if (root.view.section === "online") {
-              if (root.itemsSource !== root.viewSourceTag()) root.runSearch(true)
-              else { root.loading = false; root.busyText = "" }
+              root.loading = false
+              root.busyText = ""
             } else {
               if (root.itemsSource !== root.viewSourceTag()) root.runGrid()
               else { root.loading = false; root.busyText = "" }
@@ -926,6 +1026,25 @@ Item {
     interval: 4000
     repeat: false
     onTriggered: root.confirmDeleteKey = ""
+  }
+
+  // Live online search: typing pauses 700ms before searching, so results
+  // feel dynamic without firing one network search per keystroke. Clearing
+  // the box clears the results (runSearch's empty path); the itemsSource
+  // guard makes the post-search echo of root.query (see centerInput) a
+  // no-op instead of a second search.
+  Timer {
+    id: searchDebounce
+    interval: 700
+    repeat: false
+    onTriggered: {
+      if (!root.opened || root.view.section !== "online") return
+      var q = root.query.trim()
+      if (q === "") { root.runSearch(); return }
+      if (q.length < 2) return
+      if (root.itemsSource === "online:" + root.view.provider + ":" + q) return
+      root.runSearch()
+    }
   }
 
   PanelWindow {
@@ -1434,14 +1553,16 @@ Item {
                     font.pixelSize: Style.font.body
                     text: root.view.section === "online" ? root.query : root.filterText
                     onTextChanged: {
-                      if (root.view.section === "online") root.query = text
-                      else root.filterText = text
+                      if (root.view.section === "online") {
+                        root.query = text
+                        searchDebounce.restart()
+                      } else root.filterText = text
                     }
                     Keys.onReturnPressed: {
-                      if (root.view.section === "online") root.runSearch(false)
+                      if (root.view.section === "online") root.runSearch()
                     }
                     Keys.onEnterPressed: {
-                      if (root.view.section === "online") root.runSearch(false)
+                      if (root.view.section === "online") root.runSearch()
                     }
                     Keys.onEscapePressed: root.dismiss()
                   }
@@ -1466,7 +1587,7 @@ Item {
                   label: "Search"
                   primary: true
                   enabled: !root.loading
-                  onClicked: root.runSearch(false)
+                  onClicked: root.runSearch()
                 }
                 ActionButton {
                   visible: root.view.section !== "online"
@@ -1794,7 +1915,9 @@ Item {
 
               ActionButton {
                 visible: root.view.section === "online" && root.items.length > 0 && root.searchHasMore
-                label: "Load more"
+                label: root.searchTotal >= 0
+                  ? ("More (" + root.items.length + " of " + root.searchTotal + ")")
+                  : "Load more"
                 enabled: !root.loading
                 Layout.alignment: Qt.AlignHCenter
                 onClicked: root.loadMoreSearch()
@@ -2039,6 +2162,60 @@ Item {
                       }
                       onClicked: root.mutate(["toggle"], "")
                     }
+                  }
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 1
+                    color: root.softFill
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "PLAYBACK"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    text: "Video pauses without stopping rotation."
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  ActionButton {
+                    label: (root.playbackCfg().pauseOnBattery ? "✓ " : "") + "Pause on battery"
+                    primary: root.playbackCfg().pauseOnBattery
+                    enabled: !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.togglePauseOnBattery()
+                  }
+
+                  ActionButton {
+                    label: (root.playbackCfg().pauseWhenIdle ? "✓ " : "") + "Pause when idle"
+                    primary: root.playbackCfg().pauseWhenIdle
+                    enabled: !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.togglePauseWhenIdle()
+                  }
+
+                  Stepper {
+                    valueText: "idle " + root.playbackCfg().idleSecs + "s"
+                    onStepped: function(delta) { root.stepIdleSeconds(delta) }
+                  }
+
+                  ActionButton {
+                    label: (root.playbackCfg().muted ? "✓ " : "") + "Mute videos"
+                    primary: root.playbackCfg().muted
+                    enabled: !root.loading
+                    Layout.fillWidth: true
+                    onClicked: root.toggleMute()
                   }
 
                   Rectangle {

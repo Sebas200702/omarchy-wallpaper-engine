@@ -37,15 +37,29 @@ Item {
   // FileView watch, so this stays a "thin player" concern: bash still
   // owns what to show, this only decides whether to keep decoding it.
   readonly property string userConfigPath: home + "/.config/omarchy/wallpaper-engine.json"
-  property bool pauseOnBatteryCfg: true
+  property bool pauseOnBatteryCfg: false
   property bool pauseWhenIdleCfg: true
   property int idlePauseSecondsCfg: 120
+  property bool muteVideosCfg: true
   property bool systemPaused: false
 
   function recomputeSystemPause() {
     var shouldPause = (root.pauseOnBatteryCfg && UPower.onBattery)
       || (root.pauseWhenIdleCfg && idleMonitor.isIdle)
     if (shouldPause !== root.systemPaused) root.systemPaused = shouldPause
+  }
+
+  // Short machine-readable reason for the current system pause, for the
+  // bar tooltip: "" | "battery" | "idle" | "battery+idle". Computed live
+  // (not stored) so IPC status() always reports the present cause.
+  function systemPauseReason() {
+    if (!root.systemPaused) return ""
+    var batt = root.pauseOnBatteryCfg && UPower.onBattery
+    var idle = root.pauseWhenIdleCfg && idleMonitor.isIdle
+    if (batt && idle) return "battery+idle"
+    if (batt) return "battery"
+    if (idle) return "idle"
+    return ""
   }
 
   function reloadPauseConfig() {
@@ -297,20 +311,22 @@ Item {
 
   Process {
     id: pauseConfigProc
-    // Deliberately not `.pauseOnBattery // true` — jq's `//` treats `false`
+    // Deliberately not `.pauseOnBattery // false` — jq's `//` treats `false`
     // as falsy too, so an explicit `false` in the config would silently
-    // read back as the default `true`. Using an explicit null-check keeps
+    // read back as the default. Using an explicit null-check keeps
     // "the key is absent" distinct from "the key is false".
+    // Defaults: pauseOnBattery=false, pauseWhenIdle=true, idlePauseSeconds=120, muteVideos=true.
     command: ["bash", "-c",
-      "jq -r '(.pauseOnBattery) as $a | (.pauseWhenIdle) as $b | (.idlePauseSeconds) as $c | \"\\(if $a == null then true else $a end) \\(if $b == null then true else $b end) \\(if $c == null then 120 else $c end)\"' \"$1\" 2>/dev/null || printf 'true true 120\\n'",
+      "jq -r '(.pauseOnBattery) as $a | (.pauseWhenIdle) as $b | (.idlePauseSeconds) as $c | (.muteVideos) as $d | \"\\(if $a == null then false else $a end) \\(if $b == null then true else $b end) \\(if $c == null then 120 else $c end) \\(if $d == null then true else $d end)\"' \"$1\" 2>/dev/null || printf 'false true 120 true\\n'",
       "_", root.userConfigPath]
     stdout: StdioCollector {
       onStreamFinished: {
-        var parts = String(text || "true true 120").trim().split(/\s+/)
-        root.pauseOnBatteryCfg = parts[0] !== "false"
+        var parts = String(text || "false true 120 true").trim().split(/\s+/)
+        root.pauseOnBatteryCfg = parts[0] === "true"
         root.pauseWhenIdleCfg = parts[1] !== "false"
         var secs = parseInt(parts[2], 10)
         root.idlePauseSecondsCfg = (isFinite(secs) && secs >= 10) ? secs : 120
+        root.muteVideosCfg = parts[3] !== "false"
         root.recomputeSystemPause()
       }
     }
@@ -340,7 +356,11 @@ Item {
         video: root.videoPath,
         readyScreens: Object.keys(root.readyScreens).length,
         revealed: root.revealVideo,
-        generation: root.playGeneration
+        generation: root.playGeneration,
+        systemPaused: root.systemPaused,
+        pauseReason: root.systemPauseReason(),
+        onBattery: UPower.onBattery,
+        muted: root.muteVideosCfg
       })
     }
   }
@@ -416,6 +436,7 @@ Item {
 
       MediaPlayer {
         id: player
+        audioOutput: audioOut
         videoOutput: videoOutput
         loops: MediaPlayer.Infinite
         onErrorOccurred: function(error, errorString) {
@@ -424,6 +445,15 @@ Item {
             panel.frameDecoded = false
           }
         }
+      }
+
+      // Wallpapers are muted by default (muteVideos=true): a video with
+      // sound as a desktop background is surprising, and with one player
+      // per screen the audio would otherwise stack. Unmute from the panel's
+      // PLAYBACK section if you really want sound.
+      AudioOutput {
+        id: audioOut
+        muted: root.muteVideosCfg
       }
 
       VideoOutput {

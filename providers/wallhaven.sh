@@ -7,7 +7,7 @@
 wallhaven_search() {
   local query="${1:-}" categories="${2:-111}" purity="${3:-100}"
   local sorting="${4:-random}" atleast="${5:-1920x1080}" ratios="${6:-16x9}" page="${7:-1}"
-  local url resp
+  local url resp total last
 
   url="https://wallhaven.cc/api/v1/search?q=$(printf '%s' "$query" | jq -sRr @uri)"
   url+="&categories=${categories}&purity=${purity}&sorting=${sorting}&order=desc"
@@ -16,6 +16,10 @@ wallhaven_search() {
   url+="&page=${page}"
 
   resp=$(curl -sS --proto '=https' --max-redirs 3 -m 20 -A "omarchy-wallpaper-engine/0.1" "$url") || return 1
+  # Result totals (for pagination UI) go to stderr so stdout stays pure TSV.
+  total=$(printf '%s' "$resp" | jq -r '.meta.total // empty' 2>/dev/null)
+  last=$(printf '%s' "$resp" | jq -r '.meta.last_page // empty' 2>/dev/null)
+  [[ -n $total ]] && printf 'META total=%s pages=%s\n' "$total" "${last:-}" >&2
   printf '%s' "$resp" | jq -r '.data[]? | [.id, (.url // ""), (.path // ""), (.thumbs.large // .thumbs.small // "")] | @tsv' || return 1
 }
 
