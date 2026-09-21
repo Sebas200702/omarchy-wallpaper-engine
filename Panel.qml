@@ -2027,29 +2027,33 @@ Item {
                   height: 6
                   radius: Style.cornerRadius
                   color: root.softFill
+                  clip: true
 
                   Rectangle {
                     id: progressSlide
-                    width: 120
+                    width: Math.min(120, progressTrack.width)
                     height: parent.height
                     radius: Style.cornerRadius
                     color: root.accent
-                  }
 
-                  SequentialAnimation on x {
-                    running: root.loading
-                    loops: Animation.Infinite
-                    NumberAnimation {
-                      from: 0
-                      to: progressTrack.width - progressSlide.width
-                      duration: 1100
-                      easing.type: Easing.InOutSine
-                    }
-                    NumberAnimation {
-                      from: progressTrack.width - progressSlide.width
-                      to: 0
-                      duration: 1100
-                      easing.type: Easing.InOutSine
+                    // NOTE: this animation must live on the SLIDE (it used
+                    // to sit on the track rect, sliding the whole bar —
+                    // track included — past the column into the next panel).
+                    SequentialAnimation on x {
+                      running: root.loading
+                      loops: Animation.Infinite
+                      NumberAnimation {
+                        from: 0
+                        to: progressTrack.width - progressSlide.width
+                        duration: 1100
+                        easing.type: Easing.InOutSine
+                      }
+                      NumberAnimation {
+                        from: progressTrack.width - progressSlide.width
+                        to: 0
+                        duration: 1100
+                        easing.type: Easing.InOutSine
+                      }
                     }
                   }
 
