@@ -43,6 +43,61 @@ Item {
   property bool muteVideosCfg: true
   property bool systemPaused: false
 
+  // ---- per-monitor pins ----
+  // .monitors[{output: {file, fit}}] from wallpaper-engine.json: an output
+  // with a pin shows that file (video or image) with its own fit mode,
+  // every other output follows the global videoPath (or stays transparent
+  // for system-drawn static images). monitorConfigRaw guards the reload so
+  // a periodic refresh with identical JSON never restarts players.
+  property var monitorConfig: ({monitors: {}, imageFit: "crop"})
+  property string monitorConfigRaw: ""
+  // True when any pinned file is a video: the idle/battery pause must
+  // engage even while the global wallpaper is a (system-drawn) image.
+  property bool anyPinnedVideo: false
+
+  function validFitName(f) {
+    return f === "fit" || f === "stretch" ? f : "crop"
+  }
+
+  function screenFit(screenName) {
+    var m = monitorConfig.monitors ? monitorConfig.monitors[screenName] : null
+    if (m && (m.fit === "fit" || m.fit === "stretch" || m.fit === "crop")) return m.fit
+    return validFitName(monitorConfig.imageFit)
+  }
+
+  function isValidImagePath(p) {
+    if (!p) return false
+    var s = String(p)
+    if (s.length === 0 || s.length > maxVideoPathLen) return false
+    if (s.indexOf("\n") !== -1 || s.indexOf("\t") !== -1 || s.indexOf("\0") !== -1) return false
+    if (s.charAt(0) !== "/") return false
+    if (s.indexOf("..") !== -1) return false
+    if (!(s.indexOf(allowedConfigPrefix) === 0 || s.indexOf(allowedStatePrefix) === 0
+          || s.indexOf(allowedSystemPrefix) === 0 || s.indexOf(allowedLocalSharePrefix) === 0
+          || s.indexOf(allowedCachePrefix) === 0)) {
+      return false
+    }
+    var lower = s.toLowerCase()
+    if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
+          || lower.endsWith(".gif") || lower.endsWith(".bmp") || lower.endsWith(".webp")))
+      return false
+    return true
+  }
+
+  // Effective pinned file for one output ("" when none/invalid): validated
+  // here again because the config is user-editable outside monitor-set.
+  function pinnedFile(screenName) {
+    var m = monitorConfig.monitors ? monitorConfig.monitors[screenName] : null
+    if (!m || !m.file) return ""
+    var f = String(m.file)
+    if (isValidVideoPath(f) || isValidImagePath(f)) return f
+    return ""
+  }
+
+  function reloadMonitorConfig() {
+    if (!monitorConfigProc.running) monitorConfigProc.running = true
+  }
+
   function recomputeSystemPause() {
     var shouldPause = (root.pauseOnBatteryCfg && UPower.onBattery)
       || (root.pauseWhenIdleCfg && idleMonitor.isIdle)
@@ -98,7 +153,10 @@ Item {
   }
 
   function openThemeSwitcher() {
-    if (!themeSwitchProc.running) themeSwitchProc.running = true
+    // Detached on purpose: the theme switcher is an interactive picker that
+    // stays open as long as the user browses — a Process + watchdog would
+    // kill it mid-selection. No output to track, so nothing is lost.
+    Quickshell.execDetached(["bash", "-c", 'theme=$(timeout 60 omarchy-theme-switcher); [[ -n $theme ]] && timeout 8 omarchy-theme-set "$theme" >/dev/null 2>&1'])
   }
 
   function play(path, transitionMs) {
@@ -195,12 +253,23 @@ Item {
     onTriggered: if (advanceProc.running) advanceProc.running = false
   }
   Timer {
-    id: themeSwitchWatchdog
-    interval: 15000
+    id: nextWatchdog
+    interval: 30000
     repeat: false
-    onTriggered: if (themeSwitchProc.running) themeSwitchProc.running = false
+    onTriggered: if (nextProc.running) nextProc.running = false
   }
-
+  Timer {
+    id: prevWatchdog
+    interval: 30000
+    repeat: false
+    onTriggered: if (prevProc.running) prevProc.running = false
+  }
+  Timer {
+    id: toggleWatchdog
+    interval: 10000
+    repeat: false
+    onTriggered: if (toggleProc.running) toggleProc.running = false
+  }
   Process {
     id: pickerProc
     command: ["timeout", "30", root.script]
@@ -240,22 +309,19 @@ Item {
   Process {
     id: nextProc
     command: ["timeout", "30", root.script, "next"]
+    onRunningChanged: if (running) nextWatchdog.restart(); else nextWatchdog.stop()
   }
 
   Process {
     id: prevProc
     command: ["timeout", "30", root.script, "prev"]
+    onRunningChanged: if (running) prevWatchdog.restart(); else prevWatchdog.stop()
   }
 
   Process {
     id: toggleProc
     command: ["timeout", "10", root.script, "toggle"]
-  }
-
-  Process {
-    id: themeSwitchProc
-    command: ["bash", "-c", "timeout 12 bash -c 'theme=$(timeout 8 omarchy-theme-switcher); [[ -n $theme ]] && timeout 8 omarchy-theme-set \"$theme\" >/dev/null 2>&1 &'"]
-    onRunningChanged: if (running) themeSwitchWatchdog.restart(); else themeSwitchWatchdog.stop()
+    onRunningChanged: if (running) toggleWatchdog.restart(); else toggleWatchdog.stop()
   }
 
   Timer {
@@ -288,12 +354,15 @@ Item {
     interval: 60000
     repeat: true
     running: true
-    onTriggered: root.advanceIfDue()
+    // The monitor-config reload is a no-op when the JSON is unchanged
+    // (monitorConfigRaw guard), so piggybacking it here only costs a
+    // process spawn when a pin actually changed out-of-band.
+    onTriggered: { root.advanceIfDue(); root.reloadMonitorConfig() }
   }
 
   IdleMonitor {
     id: idleMonitor
-    enabled: root.pauseWhenIdleCfg && root.videoPath !== ""
+    enabled: root.pauseWhenIdleCfg && (root.videoPath !== "" || root.anyPinnedVideo)
     timeout: root.idlePauseSecondsCfg
     respectInhibitors: false
     onIsIdleChanged: root.recomputeSystemPause()
@@ -306,7 +375,7 @@ Item {
 
   Connections {
     target: root
-    function onVideoPathChanged() { root.recomputeSystemPause() }
+    function onVideoPathChanged() { root.recomputeSystemPause(); root.reloadMonitorConfig() }
   }
 
   Process {
@@ -337,7 +406,40 @@ Item {
     path: root.userConfigPath
     watchChanges: true
     printErrors: false
-    onFileChanged: root.reloadPauseConfig()
+    onFileChanged: { root.reloadPauseConfig(); root.reloadMonitorConfig() }
+  }
+
+  // Per-monitor pins live in the same JSON file; a tiny dedicated reader
+  // keeps them fresh without re-running the whole pause-config parse.
+  // monitorConfigRaw short-circuits identical reloads (the 60s rotation
+  // tick also refreshes this) so players never restart on a no-op.
+  Process {
+    id: monitorConfigProc
+    command: ["bash", "-c",
+      "jq -c '{monitors: (.monitors // {}), imageFit: (.imageFit // \"crop\")}' \"$1\" 2>/dev/null || printf '{\"monitors\":{},\"imageFit\":\"crop\"}'",
+      "_", root.userConfigPath]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var s = String(text || "").trim()
+        if (s === "" || s === root.monitorConfigRaw) return
+        var d = null
+        try { d = JSON.parse(s) } catch (e) { d = null }
+        if (!d || typeof d.monitors !== "object" || !d.monitors) return
+        var fit = (d.imageFit === "fit" || d.imageFit === "stretch" || d.imageFit === "crop") ? d.imageFit : "crop"
+        root.monitorConfigRaw = s
+        root.monitorConfig = ({monitors: d.monitors, imageFit: fit})
+        var anyVideo = false
+        for (var key in d.monitors) {
+          var f = String((d.monitors[key] && d.monitors[key].file) || "").toLowerCase()
+          if (f.endsWith(".mp4") || f.endsWith(".mkv") || f.endsWith(".webm") || f.endsWith(".mov") || f.endsWith(".m4v")) {
+            anyVideo = true
+            break
+          }
+        }
+        root.anyPinnedVideo = anyVideo
+        root.recomputeSystemPause()
+      }
+    }
   }
 
   IpcHandler {
@@ -351,6 +453,8 @@ Item {
     function toggle(): void { root.engineToggle() }
     function advance(): void { root.advanceIfDue() }
     function status(): string {
+      var screens = []
+      try { screens = Quickshell.screens.map(function(s) { return s.name }) } catch (e) {}
       return JSON.stringify({
         active: root.videoPath !== "",
         video: root.videoPath,
@@ -360,7 +464,10 @@ Item {
         systemPaused: root.systemPaused,
         pauseReason: root.systemPauseReason(),
         onBattery: UPower.onBattery,
-        muted: root.muteVideosCfg
+        muted: root.muteVideosCfg,
+        screens: screens,
+        monitors: root.monitorConfig.monitors,
+        imageFit: root.monitorConfig.imageFit
       })
     }
   }
@@ -370,6 +477,7 @@ Item {
     resumeProc.running = true
     preparePickerProc.running = true
     reloadPauseConfig()
+    reloadMonitorConfig()
   }
 
   Component.onDestruction: Quickshell.execDetached(["bash", "-c", 'p="$1"; [[ ! -L "$p" && -f "$p" && -x "$p" ]] && exec "$p" --cleanup-after-unload', "bash", root.cleanupHelper])
@@ -383,6 +491,24 @@ Item {
       property bool frameDecoded: false
       property int playerGeneration: -1
       property int acceptedGeneration: -1
+      // Per-screen source: a pinned file wins on this output, otherwise
+      // the global video (a global *image* stays system-drawn, layer
+      // transparent). screenImage covers pinned images only.
+      property string screenVideo: ""
+      property string screenImage: ""
+      property string screenFit: "crop"
+
+      function videoFillMode() {
+        if (screenFit === "fit") return VideoOutput.PreserveAspectFit
+        if (screenFit === "stretch") return VideoOutput.Stretch
+        return VideoOutput.PreserveAspectCrop
+      }
+
+      function imageFillMode() {
+        if (screenFit === "fit") return Image.PreserveAspectFit
+        if (screenFit === "stretch") return Image.Stretch
+        return Image.PreserveAspectCrop
+      }
 
       function syncPlayer() {
         var generation = root.playGeneration
@@ -391,14 +517,25 @@ Item {
         frameDecoded = false
         player.stop()
         player.source = ""
-        if (root.videoPath === "") {
+        var name = panel.modelData.name
+        var pin = root.pinnedFile(name)
+        screenFit = root.screenFit(name)
+        screenVideo = ""
+        screenImage = ""
+        if (pin !== "") {
+          if (root.isValidVideoPath(pin)) screenVideo = pin
+          else screenImage = pin
+        } else if (root.videoPath !== "") {
+          if (!root.isValidVideoPath(root.videoPath)) {
+            console.warn("wallpaper-engine: blocked invalid source in syncPlayer")
+            return
+          }
+          screenVideo = root.videoPath
+        }
+        if (screenVideo === "") {
           return
         }
-        if (!root.isValidVideoPath(root.videoPath)) {
-          console.warn("wallpaper-engine: blocked invalid source in syncPlayer")
-          return
-        }
-        player.source = Util.fileUrl(root.videoPath)
+        player.source = Util.fileUrl(screenVideo)
         // Skip the initial decode entirely when already system-paused
         // (e.g. the video changed while the user was idle) — refreshPlayback
         // picks it up the moment the pause lifts.
@@ -415,7 +552,7 @@ Item {
       // and the frame-ready handler already relied on, rather than forcing
       // playback regardless of where the pre-reveal dance was.
       function refreshPlayback() {
-        if (root.videoPath === "" || panel.playerGeneration !== root.playGeneration) return
+        if (panel.screenVideo === "" || panel.playerGeneration !== root.playGeneration) return
         if (root.systemPaused) {
           player.pause()
         } else if (panel.frameDecoded && !root.revealVideo) {
@@ -459,8 +596,21 @@ Item {
       VideoOutput {
         id: videoOutput
         anchors.fill: parent
-        fillMode: VideoOutput.PreserveAspectCrop
-        visible: root.videoPath !== "" && panel.frameDecoded && root.revealVideo
+        fillMode: panel.videoFillMode()
+        visible: panel.screenVideo !== "" && panel.frameDecoded && root.revealVideo
+      }
+
+      // Pinned static images render on this screen's own layer (the system
+      // background keeps showing everywhere else), so one output can hold
+      // an image while others play video — or follow the global image.
+      Image {
+        id: screenImageView
+        anchors.fill: parent
+        source: panel.screenImage !== "" ? Util.fileUrl(panel.screenImage) : ""
+        fillMode: panel.imageFillMode()
+        asynchronous: true
+        cache: false
+        visible: panel.screenImage !== "" && panel.screenVideo === ""
       }
 
       Connections {
@@ -468,12 +618,13 @@ Item {
         function onPlayGenerationChanged() { panel.syncPlayer() }
         function onRevealVideoChanged() { panel.refreshPlayback() }
         function onSystemPausedChanged() { panel.refreshPlayback() }
+        function onMonitorConfigChanged() { panel.syncPlayer() }
       }
 
       Connections {
         target: videoOutput.videoSink
         function onVideoFrameChanged() {
-          if (root.videoPath !== "" && !panel.frameDecoded
+          if (panel.screenVideo !== "" && !panel.frameDecoded
               && panel.acceptedGeneration === root.playGeneration
               && panel.playerGeneration === root.playGeneration) {
             panel.frameDecoded = true

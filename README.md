@@ -3,6 +3,9 @@
 Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 
 - **Mixed rotation**: local images + videos, shuffle without repeat, timed interval
+- **Per-monitor wallpapers**: pin a different wallpaper per output (`eDP-1`, `DP-1`…), each with its own fit mode (`crop`/`fit`/`stretch`) — sticky over rotation, survives disconnect/re-dock; everything else follows the global rotation
+- **Live download progress**: applying an online result shows a real progress bar (MB + %) instead of just elapsed time; `download-status` exposes it to scripts too
+- **Hover previews**: settling the cursor on a MoeWalls LIVE result plays its small preview webm in-cell — nothing downloads until Apply
 - **Playlists + Favorites**: named playlists with their own interval/mode, plus a flat favorites star available from any view
 - **Schedules**: fixed `HH:MM` slots that force a specific file (e.g. night video at 21:00), managed from the CLI or the panel sidebar
 - **Battery/idle-aware playback**: video decoding pauses on battery and after a period of inactivity, resumes instantly
@@ -51,6 +54,24 @@ Config lives in `~/.config/omarchy/wallpaper-engine.json` (created on first run 
 - `favorites`: a flat list of paths, toggled with the star on any grid cell or `favorite-toggle <path>`.
 - Queue state: `~/.local/state/omarchy/wallpaper-engine/queue`.
 
+### Monitors
+
+```bash
+wallpaper-engine.sh monitors                        # outputs + pins + global fit
+wallpaper-engine.sh monitor-set eDP-1 night.mp4     # pin a file to one output
+wallpaper-engine.sh monitor-fit eDP-1 fit           # crop|fit|stretch for that output
+wallpaper-engine.sh monitor-clear eDP-1             # back to following global
+wallpaper-engine.sh config-set imageFit stretch     # default fit for all outputs
+```
+
+Or do it all from the panel sidebar's MONITORS block: **Use current** pins
+whatever is showing globally, the fit button cycles `crop → fit → stretch`,
+**✕** clears. Pins are sticky over rotation/schedules, are dropped
+automatically by `delete-file`, and wait as "stale" while their output is
+disconnected (a re-docked monitor lights up as before). One caveat:
+unmuted videos play one decoder per screen, so keep `muteVideos` on with
+different videos per monitor unless you enjoy chorus.
+
 ### Battery/idle-aware playback
 
 A video wallpaper only decodes while it can actually be seen:
@@ -93,7 +114,9 @@ wallpaper-engine.sh playlist-activate "Evenings"       # or __all__ for the whol
 wallpaper-engine.sh favorite-toggle ~/.config/omarchy/backgrounds/dark/1.jpg
 wallpaper-engine.sh schedule-add 21:00 night.mp4
 wallpaper-engine.sh schedule-remove 21:00
-wallpaper-engine.sh delete-file <path>                  # removes from disk + playlists/favorites; advances rotation if it was current
+wallpaper-engine.sh delete-file <path>                  # removes from disk + playlists/favorites/monitors; advances rotation if it was current
+wallpaper-engine.sh monitors | monitor-set eDP-1 <file> | monitor-clear eDP-1 | monitor-fit eDP-1 fit
+wallpaper-engine.sh download-status | preview-fetch <key>
 ```
 
 Online (native picker; the panel's own search UI calls `grid-search`/`apply-key` instead):
@@ -118,6 +141,7 @@ rotation — is paused.
 Summon with the bar widget or `omarchy-shell shell summon sebas.wallpaper-engine`:
 
 - **Library / Playlists / Favorites** in the sidebar, each a grid of thumbnails.
+- **Monitors** in the sidebar: per-output pins + fit modes + the global default fit.
 - **Keyboard navigation**: arrow keys move the selection, Enter applies it.
 - **Star** on every cell (or the Favorite button) toggles favorites; **×** removes an item from the playlist you're viewing.
 - **Delete from disk**: two-step inline confirm (click once to arm, again to confirm) — permanently removes the file, drops it from any playlist/favorites, and advances rotation if it was the current wallpaper.
@@ -174,9 +198,7 @@ Removal stops playback, restores last static wallpaper, removes menu override an
 
 ## Known limitations
 
-- **Single wallpaper for all monitors.** The video player is one shared
-  `videoPath` replicated to every screen; there's no per-monitor selection
-  or per-monitor fit mode yet. Untested beyond a single-monitor setup.
-- **No live download progress bar** — the panel shows elapsed time, not a
-  percentage, while a download is in flight.
-- **No hover preview** for MoeWalls search results before downloading.
+- **Single-monitor testing only.** Per-monitor rendering is written
+  output-agnostic (one layer per `Quickshell.screens` entry), but only
+  verified on one screen so far — multi-monitor feedback welcome.
+- **No per-playlist schedules** — schedules are global `HH:MM` slots.

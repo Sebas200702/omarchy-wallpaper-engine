@@ -5,6 +5,9 @@
   "includeImages": true,
   "includeVideos": true,
   "transitionMs": 420,
+  "imageFit": "crop",
+  "monitors": {
+  },
   "schedules": [
   ],
   "maxVideoBytes": 524288000,

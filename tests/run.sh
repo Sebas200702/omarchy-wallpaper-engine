@@ -305,5 +305,107 @@ env_nototal_short=$(call "$th12" emit_search_envelope "$th12/partial.json" 1 20 
 assert_eq "emit_search_envelope: unknown total + short page has no more" \
   "false" "$(printf '%s' "$env_nototal_short" | jq -r .hasMore)"
 
+# ---- valid_monitor_fit ----
+th13=$(new_testhome)
+assert_rc "valid_monitor_fit: crop passes" \
+  0 "$(call_rc "$th13" valid_monitor_fit crop; echo $?)"
+assert_rc "valid_monitor_fit: fit passes" \
+  0 "$(call_rc "$th13" valid_monitor_fit fit; echo $?)"
+assert_rc "valid_monitor_fit: stretch passes" \
+  0 "$(call_rc "$th13" valid_monitor_fit stretch; echo $?)"
+assert_rc "valid_monitor_fit: zoom fails" \
+  1 "$(call_rc "$th13" valid_monitor_fit zoom; echo $?)"
+assert_rc "valid_monitor_fit: empty fails" \
+  1 "$(call_rc "$th13" valid_monitor_fit ""; echo $?)"
+
+# ---- monitor_set / monitor_fit / monitor_clear / monitors_json ----
+th14=$(new_testhome)
+mkdir -p "$th14/.config/omarchy/backgrounds/dark"
+touch "$th14/.config/omarchy/backgrounds/dark/a.jpg" "$th14/.config/omarchy/backgrounds/dark/b.mp4"
+mon_set=$(call "$th14" monitor_set "DP-1" "$th14/.config/omarchy/backgrounds/dark/a.jpg")
+assert_eq "monitor_set: pin stored with default crop fit" \
+  "crop" "$(printf '%s' "$mon_set" | jq -r '.stale[0].fit')"
+assert_eq "monitor_set: unconnected output reported as stale" \
+  "DP-1" "$(printf '%s' "$mon_set" | jq -r '.stale[0].name')"
+assert_eq "monitor_set: stale pin keeps the file" \
+  "$th14/.config/omarchy/backgrounds/dark/a.jpg" "$(printf '%s' "$mon_set" | jq -r '.stale[0].file')"
+mon_fit=$(call "$th14" monitor_fit "DP-1" "fit")
+assert_eq "monitor_fit: fit change sticks" \
+  "fit" "$(printf '%s' "$mon_fit" | jq -r '.stale[0].fit')"
+assert_rc "monitor_fit: invalid mode rejected" \
+  1 "$(call_rc "$th14" monitor_fit "DP-1" "zoom"; echo $?)"
+assert_rc "monitor_fit: pin required before fit" \
+  1 "$(call_rc "$th14" monitor_fit "HDMI-1" "fit"; echo $?)"
+assert_rc "monitor_set: hostile output name rejected" \
+  1 "$(call_rc "$th14" monitor_set 'a;b' "$th14/.config/omarchy/backgrounds/dark/a.jpg"; echo $?)"
+assert_rc "monitor_set: missing file rejected" \
+  1 "$(call_rc "$th14" monitor_set "DP-1" "$th14/.config/omarchy/backgrounds/dark/nope.jpg"; echo $?)"
+assert_rc "monitor_set: file outside allowed prefixes rejected" \
+  1 "$(call_rc "$th14" monitor_set "DP-1" "/etc/hostname"; echo $?)"
+mon_clear=$(call "$th14" monitor_clear "DP-1")
+assert_eq "monitor_clear: stale pin removed" \
+  "0" "$(printf '%s' "$mon_clear" | jq -r '.stale | length')"
+# video pin keeps its fit across re-set
+call "$th14" monitor_set "DP-1" "$th14/.config/omarchy/backgrounds/dark/b.mp4" >/dev/null
+call "$th14" monitor_fit "DP-1" "stretch" >/dev/null
+mon_reset=$(call "$th14" monitor_set "DP-1" "$th14/.config/omarchy/backgrounds/dark/a.jpg")
+assert_eq "monitor_set: re-set preserves existing fit" \
+  "stretch" "$(printf '%s' "$mon_reset" | jq -r '.stale[0].fit')"
+# delete-file drops monitor pins pointing at the removed file
+call "$th14" delete_wallpaper_file "$th14/.config/omarchy/backgrounds/dark/a.jpg" >/dev/null
+mon_after_del=$(call "$th14" monitors_json)
+assert_eq "delete-file: monitor pin for deleted file is gone" \
+  "0" "$(printf '%s' "$mon_after_del" | jq -r '.stale | length')"
+assert_eq "monitors_json: imageFit defaults to crop" \
+  "crop" "$(printf '%s' "$mon_after_del" | jq -r '.imageFit')"
+
+# ---- config_set_key imageFit ----
+th15=$(new_testhome)
+echo '{}' >"$th15/.config/omarchy/wallpaper-engine.json"
+call "$th15" config_set_key imageFit fit >/dev/null
+assert_eq "config_set_key: imageFit fit sticks" \
+  "fit" "$(call "$th15" cfg .imageFit crop)"
+assert_rc "config_set_key: imageFit zoom rejected" \
+  1 "$(call_rc "$th15" config_set_key imageFit zoom; echo $?)"
+
+# ---- download progress roundtrip ----
+th16=$(new_testhome)
+assert_eq "download_status: idle without progress file" \
+  "false" "$(call "$th16" download_status | jq -r .active)"
+call "$th16" write_download_progress 500 1000 "moewalls" >/dev/null
+dl_mid=$(call "$th16" download_status)
+assert_eq "download_status: active while downloading" \
+  "true" "$(printf '%s' "$dl_mid" | jq -r .active)"
+assert_eq "download_status: percent math (500/1000 -> 50)" \
+  "50" "$(printf '%s' "$dl_mid" | jq -r .percent)"
+assert_eq "download_status: downloaded bytes tracked" \
+  "500" "$(printf '%s' "$dl_mid" | jq -r .downloaded)"
+call "$th16" write_download_progress 250 "" "wallhaven" >/dev/null
+dl_unknown=$(call "$th16" download_status)
+assert_eq "download_status: unknown total encodes as null" \
+  "null" "$(printf '%s' "$dl_unknown" | jq -r .total)"
+call "$th16" finish_download_progress true >/dev/null
+assert_eq "finish_download_progress: download marked done" \
+  "true" "$(call "$th16" download_status | jq -r .ok)"
+
+# ---- preview_fetch (offline paths) ----
+th17=$(new_testhome)
+assert_rc "preview_fetch: missing meta fails" \
+  1 "$(call_rc "$th17" preview_fetch "/cache/moe-x.jpg"; echo $?)"
+mkdir -p "$th17/.local/state/omarchy/wallpaper-engine"
+printf 'stub\tmoewalls\ttok\tpage\ttitle\t\n' >"$th17/.local/state/omarchy/wallpaper-engine/online-meta.tsv"
+assert_rc "preview_fetch: empty preview column fails" \
+  1 "$(call_rc "$th17" preview_fetch "stub"; echo $?)"
+printf 'stub2\tmoewalls\ttok\tpage\ttitle\thttps://evil.example/x.webm\n' >>"$th17/.local/state/omarchy/wallpaper-engine/online-meta.tsv"
+assert_rc "preview_fetch: off-host preview rejected" \
+  1 "$(call_rc "$th17" preview_fetch "stub2"; echo $?)"
+# cache hit: pre-seeded preview is returned without network
+mkdir -p "$th17/.cache/omarchy/wallpaper-engine/online/previews"
+printf 'fake-webm-bytes' >"$th17/.cache/omarchy/wallpaper-engine/online/previews/moe-abc.webm"
+printf '/c/moe-abc.jpg\tmoewalls\ttok\tpage\ttitle\thttps://moewalls.com/pv.webm\n' >>"$th17/.local/state/omarchy/wallpaper-engine/online-meta.tsv"
+assert_eq "preview_fetch: cache hit returns the webm path" \
+  "$th17/.cache/omarchy/wallpaper-engine/online/previews/moe-abc.webm" \
+  "$(call "$th17" preview_fetch "/c/moe-abc.jpg")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

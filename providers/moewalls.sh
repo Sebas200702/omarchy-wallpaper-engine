@@ -79,15 +79,25 @@ moewalls_download_url() {
 }
 
 # moewalls_download <token> <dest> <max_bytes> — full mp4 via go.moewalls.com
+# When DOWNLOAD_PROGRESS_LABEL is set (apply-key path), the download is
+# tracked for `download-status`/panel progress bar; otherwise unchanged.
 moewalls_download() {
   local token="$1" dest="$2" max_bytes="${3:-524288000}"
-  local tmp ctype size
+  local tmp ctype size total=""
   # re-validate at the trust boundary: this function is also reachable
   # directly, and the token may have crossed a state file since detail
   # parsing.
   [[ -n $token && $token =~ ^[A-Za-z0-9_.=%-]{1,256}$ ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .moe.XXXXXX) || return 1
-  if ! run_curl_killable -sSL --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
+  if [[ -n ${DOWNLOAD_PROGRESS_LABEL:-} ]]; then
+    total=$(head_content_length "$(moewalls_download_url "$token")")
+    write_download_progress 0 "$total" "$DOWNLOAD_PROGRESS_LABEL"
+    if ! run_curl_tracked "$DOWNLOAD_PROGRESS_LABEL" "$total" "$tmp" -- \
+        -sSL --fail --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
+        -o "$tmp" "$(moewalls_download_url "$token")"; then
+      rm -f "$tmp"; return 1
+    fi
+  elif ! run_curl_killable -sSL --fail --proto '=https' --max-redirs 3 -m 120 -A "Mozilla/5.0 (X11; Linux x86_64)" \
       -o "$tmp" "$(moewalls_download_url "$token")"; then
     rm -f "$tmp"; return 1
   fi
@@ -105,12 +115,23 @@ moewalls_download() {
   mv -f "$tmp" "$dest"
 }
 
-# moewalls_preview <preview_url> <dest> — small webm for fast picker preview
+# moewalls_preview <preview_url> <dest> — small webm for fast hover preview
+# (~2MB, hotlink OK). Validates host + content so an error page can never
+# end up cached as a preview.
 moewalls_preview() {
-  local preview_url="$1" dest="$2"
+  local preview_url="$1" dest="$2" tmp ctype size
   case "$preview_url" in
     https://moewalls.com/*) ;;
     *) return 1 ;;
   esac
-  curl -sSL --proto '=https' --max-redirs 3 -m 60 -A "Mozilla/5.0 (X11; Linux x86_64)" -o "$dest" "$preview_url"
+  tmp=$(mktemp -p "$(dirname "$dest")" .mprev.XXXXXX) || return 1
+  if ! run_curl_killable -sSL --fail --proto '=https' --max-redirs 3 -m 60 --max-filesize 20971520 \
+      -A "Mozilla/5.0 (X11; Linux x86_64)" -o "$tmp" "$preview_url"; then
+    rm -f "$tmp"; return 1
+  fi
+  ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
+  case "$ctype" in video/*) ;; *) rm -f "$tmp"; return 1 ;; esac
+  size=$(stat -Lc '%s' "$tmp" 2>/dev/null || echo 0)
+  if [[ ! $size =~ ^[0-9]+$ ]] || (( size < 1024 || size > 20971520 )); then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$dest"
 }

@@ -20,6 +20,8 @@ readonly lastchange_state="$state_dir/last-change"
 readonly paused_state="$state_dir/paused"
 readonly current_state="$state_dir/current"
 readonly online_meta="$state_dir/online-meta.tsv"
+readonly download_progress="$state_dir/download.progress"
+readonly preview_cache_name="previews"
 readonly cleanup_helper="$state_dir/cleanup"
 readonly rows_cache="$state_dir/picker-rows"
 readonly rows_signature_state="$state_dir/picker-signature"
@@ -52,12 +54,74 @@ readonly MOE_DETAIL_TTL=86400
 # mirrors what a plain `curl "$@"` would have set.
 run_curl_killable() {
   curl "$@" &
-  local cpid=$! rc
+  local cpid=$! rc prev_term prev_int
+  prev_term=$(trap -p TERM); prev_int=$(trap -p INT)
   # shellcheck disable=SC2064 -- intentional: expand $cpid now, not at trap time
   trap "kill -TERM $cpid 2>/dev/null; wait $cpid 2>/dev/null; exit 143" TERM INT
   wait "$cpid"
   rc=$?
+  # restore whatever the caller had (grid_search_json arms its own _kill_tree
+  # trap before calling us — blanking it here used to orphan its children)
+  if [[ -n $prev_term ]]; then eval "$prev_term"; else trap - TERM; fi
+  if [[ -n $prev_int ]]; then eval "$prev_int"; else trap - INT; fi
+  return "$rc"
+}
+
+# head_content_length <url> — best-effort total bytes via HEAD (empty when
+# unknown: chunked responses, HEAD-less endpoints). Never fails the caller.
+head_content_length() {
+  local len
+  len=$(curl -sSI --proto '=https' --max-redirs 3 -m 10 -A "omarchy-wallpaper-engine/0.1" "$1" 2>/dev/null \
+    | grep -i '^content-length:' | tail -n1 | awk '{print $2}' | tr -d '\r') || len=""
+  [[ $len =~ ^[0-9]+$ && $len -gt 0 ]] && printf '%s' "$len" || true
+}
+
+# write_download_progress <downloaded_bytes> <total_or_empty> <label>
+# — refreshes $download_progress (active download) for `download-status`
+# and the panel's live progress bar.
+write_download_progress() {
+  local done_b="${1:-0}" total="${2:-}" label="${3:-}"
+  [[ $done_b =~ ^[0-9]+$ ]] || done_b=0
+  if [[ $total =~ ^[0-9]+$ && $total -gt 0 ]]; then
+    jq -n --argjson d "$done_b" --argjson t "$total" --arg l "$label" \
+      '{active:true, downloaded:$d, total:$t, percent:(($d*1000/$t|floor)/10), label:$l}' >"$download_progress.tmp" 2>/dev/null \
+      && mv -f "$download_progress.tmp" "$download_progress" 2>/dev/null || true
+  else
+    jq -n --argjson d "$done_b" --arg l "$label" \
+      '{active:true, downloaded:$d, total:null, percent:null, label:$l}' >"$download_progress.tmp" 2>/dev/null \
+      && mv -f "$download_progress.tmp" "$download_progress" 2>/dev/null || true
+  fi
+}
+
+# finish_download_progress <ok> [error] — marks the download done/failed.
+finish_download_progress() {
+  local ok="${1:-false}" err="${2:-}"
+  jq -n --argjson ok "$ok" --arg e "$err" '{active:false, ok:$ok, error:$e}' >"$download_progress.tmp" 2>/dev/null \
+    && mv -f "$download_progress.tmp" "$download_progress" 2>/dev/null || true
+}
+
+# run_curl_tracked <label> <total_or_empty> <tmpfile> -- <curl args...>
+# — like run_curl_killable, but polls <tmpfile> size while curl runs and
+# publishes progress for `download-status`. Used by the provider download
+# functions when DOWNLOAD_PROGRESS_LABEL is set (panel/CLI apply-key path);
+# without it they keep their exact current behavior.
+run_curl_tracked() {
+  local label="$1" total="$2" tmp="$3"; shift 3
+  [[ ${1:-} == -- ]] && shift
+  run_curl_killable "$@" &
+  local cpid=$! rc done_b
+  # shellcheck disable=SC2064 -- intentional: expand $cpid now, not at trap time
+  trap "kill -TERM $cpid 2>/dev/null; wait $cpid 2>/dev/null; exit 143" TERM INT
+  while kill -0 "$cpid" 2>/dev/null; do
+    done_b=$(stat -Lc '%s' "$tmp" 2>/dev/null || echo 0)
+    write_download_progress "$done_b" "$total" "$label"
+    sleep 0.2
+  done
+  wait "$cpid"
+  rc=$?
   trap - TERM INT
+  done_b=$(stat -Lc '%s' "$tmp" 2>/dev/null || echo 0)
+  write_download_progress "$done_b" "$total" "$label"
   return "$rc"
 }
 
@@ -100,7 +164,7 @@ ensure_config() {
       cp -f "$plugin_dir/config.example.json" "$user_config"
       chmod 0600 "$user_config" 2>/dev/null || true
     else
-      printf '{"enabled":true,"intervalMinutes":10,"mode":"shuffle","includeImages":true,"includeVideos":true,"transitionMs":420,"schedules":[]}\n' >"$user_config"
+      printf '{"enabled":true,"intervalMinutes":10,"mode":"shuffle","includeImages":true,"includeVideos":true,"transitionMs":420,"imageFit":"crop","monitors":{},"schedules":[]}\n' >"$user_config"
     fi
   fi
 }
@@ -388,7 +452,7 @@ delete_wallpaper_file() {
   canon=$(readlink -f "$path") || return 1
   [[ -f $canon ]] || { echo "not found: $canon" >&2; return 1; }
   rm -f -- "$canon" "${canon}.attribution.json" || { echo "could not delete: $canon" >&2; return 1; }
-  save_config_filtered '.playlists[]? |= (.items |= map(select(. != $f))) | .favorites = ((.favorites // []) | map(select(. != $f)))' --arg f "$canon" || true
+  save_config_filtered '.playlists[]? |= (.items |= map(select(. != $f))) | .favorites = ((.favorites // []) | map(select(. != $f))) | .monitors |= with_entries(select(.value.file != $f))' --arg f "$canon" || true
   reset_rotation_state
   if [[ -s $current_state && $(<"$current_state") == "$canon" ]]; then
     do_next >/dev/null 2>&1 || true
@@ -711,6 +775,71 @@ schedule_remove() {
   schedules_json
 }
 
+# ---- per-monitor wallpapers ----
+# The global engine (rotation/schedules/playlists) keeps driving one shared
+# "current" wallpaper. .monitors[{output: {file, fit}}] pins a specific
+# wallpaper (+ fit mode) to one output; the Service renders it on that
+# screen's own layer while every other screen follows the global current.
+# Assignments survive rotation (sticky until cleared) and disconnected
+# outputs (reported as "stale" so a re-docked monitor lights up as before).
+valid_monitor_fit() { [[ ${1:-} == crop || ${1:-} == fit || ${1:-} == stretch ]]; }
+
+monitor_outputs() {
+  # monitor_outputs — TSV name \t width \t height from hyprctl (rc 1 when
+  # the compositor query is unavailable, e.g. headless tests).
+  hyprctl monitors -j 2>/dev/null | jq -r '.[]? | [.name, .width, .height] | @tsv' 2>/dev/null
+}
+
+monitors_json() {
+  local cfg_mon fit outs_json cur="global"
+  cfg_mon=$(jq -c '.monitors // {}' "$user_config" 2>/dev/null) || cfg_mon='{}'
+  fit=$(cfg '.imageFit' 'crop'); valid_monitor_fit "$fit" || fit="crop"
+  [[ -s $current_state ]] && cur=$(<"$current_state") || cur=""
+  outs_json=$(monitor_outputs 2>/dev/null | jq -R -s \
+    '[split("\n")[] | select(length > 0) | split("\t") | select(length >= 3)
+      | {name: .[0], width: (.[1] | tonumber? // 0), height: (.[2] | tonumber? // 0)}]' 2>/dev/null) || outs_json='[]'
+  jq -n --argjson m "$cfg_mon" --argjson outs "$outs_json" --arg fit "$fit" --arg cur "$cur" '
+    ($outs | map(.name)) as $names
+    | {outputs: [$outs[] | . + {connected: true,
+        file: ($m[.name].file // null), fit: ($m[.name].fit // null)}],
+       stale: [$m | to_entries[]
+         | select(.key as $k | $names | index($k) | not)
+         | {name: .key, connected: false, file: .value.file, fit: .value.fit}],
+       imageFit: $fit,
+       globalFile: (if $cur == "" then null else $cur end)}'
+}
+
+monitor_set() {
+  local out="${1:-}" file="${2:-}" canon cur_fit
+  [[ -n $out && -n $file ]] || { echo "usage: monitor-set <output> <file>" >&2; return 1; }
+  [[ $out =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "invalid output name: $out" >&2; return 1; }
+  validate_wallpaper_path "$file" || { echo "invalid or not an allowed wallpaper path: $file" >&2; return 1; }
+  canon=$(readlink -f "$file") || return 1
+  [[ -f $canon ]] || { echo "not found: $canon" >&2; return 1; }
+  cur_fit=$(jq -r --arg o "$out" '.monitors[$o].fit // empty' "$user_config" 2>/dev/null)
+  valid_monitor_fit "$cur_fit" || cur_fit="crop"
+  save_config_filtered '.monitors[$o] = {file: $f, fit: $fit}' \
+    --arg o "$out" --arg f "$canon" --arg fit "$cur_fit" || return 1
+  monitors_json
+}
+
+monitor_clear() {
+  local out="${1:-}"
+  [[ -n $out ]] || { echo "usage: monitor-clear <output>" >&2; return 1; }
+  save_config_filtered 'del(.monitors[$o])' --arg o "$out" || return 1
+  monitors_json
+}
+
+monitor_fit() {
+  local out="${1:-}" mode="${2:-}"
+  [[ -n $out && -n $mode ]] || { echo "usage: monitor-fit <output> <crop|fit|stretch>" >&2; return 1; }
+  valid_monitor_fit "$mode" || { echo "fit must be crop|fit|stretch" >&2; return 1; }
+  jq -e --arg o "$out" '.monitors[$o].file' "$user_config" >/dev/null 2>&1 \
+    || { echo "no wallpaper assigned to $out — use monitor-set first" >&2; return 1; }
+  save_config_filtered '.monitors[$o].fit = $m' --arg o "$out" --arg m "$mode" || return 1
+  monitors_json
+}
+
 advance_if_due() {
   local enabled paused now last interval sched_time sched_pick sched_epoch
   enabled=$(cfg '.enabled' 'true')
@@ -811,10 +940,13 @@ do_status() {
   (( next_in < 0 )) && next_in=0
   next_sched=$(jq -r '.schedules[]? | .time' "$user_config" 2>/dev/null | sort | awk -v now="$(date +%H:%M)" '$1 > now {print $1; exit}')
   playlist=$(active_playlist_name)
+  mons=$(jq -c '.monitors // {}' "$user_config" 2>/dev/null) || mons='{}'
+  fit=$(cfg '.imageFit' 'crop'); valid_monitor_fit "$fit" || fit="crop"
   jq -n --arg cur "$cur" --arg kind "$kind" --argjson active "$active" --argjson paused "$paused" \
     --argjson nextIn "$next_in" --argjson queue "$queue_len" --arg sched "$next_sched" \
     --arg playlist "$playlist" --argjson interval "$interval" \
-    '{active:$active, file:$cur, kind:$kind, paused:$paused, nextInSec:$nextIn, queueLen:$queue, nextSchedule:$sched, playlist:$playlist, intervalMinutes:$interval}'
+    --argjson monitors "$mons" --arg imageFit "$fit" \
+    '{active:$active, file:$cur, kind:$kind, paused:$paused, nextInSec:$nextIn, queueLen:$queue, nextSchedule:$sched, playlist:$playlist, intervalMinutes:$interval, monitors:$monitors, imageFit:$imageFit}'
 }
 
 # ---- online ----
@@ -908,29 +1040,84 @@ online_apply_stub() {
   # title), not just as the key.
   line=$(awk -F '\t' -v key="$stub" '$1 == key { print; exit }' "$online_meta")
   [[ -n $line ]] || return 1
-  IFS=$'\t' read -r _stub provider a b c <<<"$line"
+  IFS=$'\t' read -r _stub provider a b c _preview <<<"$line"
   mapfile -t _dirs < <(theme_dirs)
   udir="${_dirs[1]}"; online_dir="${_dirs[2]}"
   ensure_secure_dir "$online_dir" || return 1
   max_bytes=$(effective_max_video_bytes)
+  # Live progress for the panel's bar (`download-status` polls the file
+  # while the provider download below runs in this same process).
+  export DOWNLOAD_PROGRESS_LABEL="$provider"
+  write_download_progress 0 "" "$provider"
   if [[ $provider == wallhaven ]]; then
     ext="${a##*.}"; ext="${ext%%\?*}"; [[ $ext =~ ^(jpg|jpeg|png|webp)$ ]] || ext="jpg"
     fname="wh-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.${ext}"
     dest="$online_dir/$fname"
     omarchy-notification-send "Downloading wallpaper…" -t 1500
-    wallhaven_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    if ! wallhaven_download "$a" "$dest" "$max_bytes"; then
+      finish_download_progress false "download failed"
+      unset DOWNLOAD_PROGRESS_LABEL
+      omarchy-notification-send "Download failed" -t 2000; return 1
+    fi
     write_attribution_sidecar "$dest" "wallhaven" "$b" "$c"
+    unset DOWNLOAD_PROGRESS_LABEL
+    finish_download_progress true
     apply_file "$dest"
   elif [[ $provider == moewalls ]]; then
     fname="moe-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.mp4"
     dest="$online_dir/$fname"
     omarchy-notification-send "Downloading live wallpaper (50-100 MB)…" -t 2500
-    moewalls_download "$a" "$dest" "$max_bytes" || { omarchy-notification-send "Download failed" -t 2000; return 1; }
+    if ! moewalls_download "$a" "$dest" "$max_bytes"; then
+      finish_download_progress false "download failed"
+      unset DOWNLOAD_PROGRESS_LABEL
+      omarchy-notification-send "Download failed" -t 2000; return 1
+    fi
     write_attribution_sidecar "$dest" "moewalls" "$b" "$c"
+    unset DOWNLOAD_PROGRESS_LABEL
+    finish_download_progress true
     apply_file "$dest"
   else
+    unset DOWNLOAD_PROGRESS_LABEL
     return 1
   fi
+}
+
+# download_status — prints the live (or last finished) download progress as
+# {"active":bool, "downloaded":n, "total":n|null, "percent":n|null, ...}.
+# The panel polls this while apply-key downloads; CLI users can watch too.
+download_status() {
+  if [[ -s $download_progress ]] && jq -e . "$download_progress" >/dev/null 2>&1; then
+    cat "$download_progress"
+  else
+    printf '{"active":false}\n'
+  fi
+}
+
+# preview_fetch <stub> — prints the local path of a MoeWalls preview webm
+# for hover-preview, downloading (~2MB) and caching it on first use.
+# Silent rc 1 on any failure: the panel simply hides the preview overlay.
+preview_fetch() {
+  local stub="${1:-}" line preview slug pdir dest tmp ctype size
+  [[ -n $stub ]] || return 1
+  [[ -f $online_meta ]] || return 1
+  line=$(awk -F '\t' -v key="$stub" '$1 == key { print; exit }' "$online_meta")
+  [[ -n $line ]] || return 1
+  preview=$(printf '%s' "$line" | cut -f6)
+  case "$preview" in https://moewalls.com/*) ;; *) return 1 ;; esac
+  slug=$(basename "$stub" .jpg)
+  [[ $slug =~ ^[A-Za-z0-9._-]{1,128}$ ]] || return 1
+  pdir="$cache_dir/online/$preview_cache_name"
+  ensure_secure_dir "$pdir" || return 1
+  dest="$pdir/${slug}.webm"
+  if [[ -s $dest && ! -L $dest ]]; then printf '%s\n' "$dest"; return 0; fi
+  moewalls_preview "$preview" "${dest}.tmp" || return 1
+  tmp="${dest}.tmp"
+  ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
+  case "$ctype" in video/*) ;; *) rm -f "$tmp"; return 1 ;; esac
+  size=$(stat -Lc '%s' "$tmp" 2>/dev/null || echo 0)
+  if [[ ! $size =~ ^[0-9]+$ ]] || (( size < 1024 || size > 20971520 )); then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+  printf '%s\n' "$dest"
 }
 
 online_cache_bytes() {
@@ -1026,12 +1213,19 @@ grid_local_json() {
 # atomic via .tmp + mv so parallel xargs workers never leave half-written
 # files behind. Skips when dest already exists (cache hit).
 fetch_thumb() {
-  local url="$1" dest="$2" tmp
+  local url="$1" dest="$2" tmp ctype
   [[ -n $url && -n $dest ]] || return 1
   [[ -s $dest ]] && return 0
-  tmp="${dest}.tmp"
-  curl -sSL --proto '=https' --max-redirs 3 -m 12 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  # unique tmp per destination: xargs -P6 workers share $dest
+  tmp=$(mktemp -p "$(dirname "$dest")" .thumb.XXXXXX) || return 1
+  if ! curl -sSL --fail --proto '=https' --max-redirs 3 -m 12 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$url" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
   [[ -s $tmp ]] || { rm -f "$tmp"; return 1; }
+  # never cache an error page as an image: without this a single 404 HTML
+  # response poisons the thumb cache forever ([[ ! -s stub ]] never retries)
+  ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
+  case "$ctype" in image/*) ;; *) rm -f "$tmp"; return 1 ;; esac
   mv -f "$tmp" "$dest"
 }
 
@@ -1287,6 +1481,11 @@ grid_search_json() {
       [[ -n $token ]] || continue
       [[ -n $dtitle ]] && title="$dtitle"
       title=${title//$'\t'/ }
+      # Normalize the preview URL once, here: hover-preview (`preview-fetch`)
+      # and the panel items below both consume it, and a relative or
+      # off-host value must never leave this loop.
+      if [[ $preview == /* ]]; then preview="${MOEWALLS_BASE}${preview}"; fi
+      case "$preview" in https://moewalls.com/*) ;; *) preview="" ;; esac
       # Query-independent thumb name (moe-<id>.jpg): same cache-hit rationale
       # as wallhaven above; the title stays in rows/meta, not the filename.
       slug="moe-$(safe_slug "$id")"
@@ -1314,8 +1513,8 @@ grid_search_json() {
         esac
       fi
       [[ -s $stub ]] || continue
-      printf '%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" >>"$rows"
-      printf '%s\tmoewalls\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" >>"$online_meta"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "${preview:-}" >>"$rows"
+      printf '%s\tmoewalls\t%s\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" "${preview:-}" >>"$online_meta"
     done <"$numbered_tmp.done"
     rm -f "$numbered_tmp.done"
     rm -rf "$det_tmp"
@@ -1329,21 +1528,22 @@ grid_search_json() {
     # instead of drowning between loosely related posts.
     jq -R -s --arg q "$query" '
       ($q | ascii_downcase | split(" ") | map(select(length > 0))) as $words
-      | [split("\n")[] | select(length > 0) | split("\t")
-       | select(length >= 5)
-       | {key: .[0], kind: .[1], page: .[2],
-          title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
-          thumb: .[0]}
-       | (.title | ascii_downcase) as $tl
-       | . + {score: ([$words[] | select(. as $w | $tl | contains($w))] | length)}]
-      | sort_by(-.score) | map(del(.score))' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
+       | [split("\n")[] | select(length > 0) | split("\t")
+        | select(length >= 5)
+        | {key: .[0], kind: .[1], page: .[2],
+           title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
+           thumb: .[0]}
+        | (.title | ascii_downcase) as $tl
+        | . + {score: ([$words[] | select(. as $w | $tl | contains($w))] | length),
+               preview: (if .[5] == "" or .[5] == null then null else .[5] end)}]
+       | sort_by(-.score) | map(del(.score))' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
   else
     jq -R -s '
       [split("\n")[] | select(length > 0) | split("\t")
        | select(length >= 5)
        | {key: .[0], kind: .[1], page: .[2],
           title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
-          thumb: .[0]}]' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
+          thumb: .[0], preview: null}]' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
   fi
   trap - TERM INT
   emit_search_envelope "$items_tmp" "$page_num" "$cap" "$total" || cat "$items_tmp"
@@ -1363,6 +1563,9 @@ config_set_key() {
     mode)
       [[ $val == shuffle || $val == sequential ]] || { echo "mode must be shuffle|sequential" >&2; rm -f "$tmp"; return 1; }
       jq --arg m "$val" '.mode = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    imageFit)
+      [[ $val == crop || $val == fit || $val == stretch ]] || { echo "imageFit must be crop|fit|stretch" >&2; rm -f "$tmp"; return 1; }
+      jq --arg m "$val" '.imageFit = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
@@ -1733,6 +1936,10 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
   wallpaper-engine.sh delete-file <path> | favorite-toggle <path>
   wallpaper-engine.sh schedules | schedule-add <HH:MM> <pick> | schedule-remove <HH:MM> [pick]
+  wallpaper-engine.sh monitors | monitor-set <output> <file> | monitor-clear <output> | monitor-fit <output> <crop|fit|stretch>
+    # per-monitor pins: sticky over rotation, shown with per-output fit mode
+  wallpaper-engine.sh download-status | preview-fetch <key>
+    # live download progress (polled by the panel) + cached hover previews
   wallpaper-engine.sh online-status | online-clear [--all]
   wallpaper-engine.sh --resume | --prepare-picker | --stop-if-changed | --advance-if-due
   wallpaper-engine.sh --wire-menu | --unwire-menu | --uninstall | --cleanup-after-unload
@@ -1790,6 +1997,12 @@ case "${1:-}" in
   playlist-mode) playlist_set_mode "${2:-}" "${3:-}" ;;
   delete-file) delete_wallpaper_file "${2:-}" ;;
   favorite-toggle) favorite_toggle "${2:-}" ;;
+  monitors) monitors_json ;;
+  monitor-set) monitor_set "${2:-}" "${3:-}" ;;
+  monitor-clear) monitor_clear "${2:-}" ;;
+  monitor-fit) monitor_fit "${2:-}" "${3:-}" ;;
+  download-status) download_status ;;
+  preview-fetch) preview_fetch "${2:-}" ;;
   schedules) schedules_json ;;
   schedule-add) schedule_add "${2:-}" "${3:-}" ;;
   schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;

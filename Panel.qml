@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
+import QtMultimedia
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -46,6 +47,16 @@ Item {
   // confirmDeleteTimer's window actually deletes) — a lightweight inline
   // confirm instead of a modal, so one misclick can't delete a file.
   property string confirmDeleteKey: ""
+  // ---- per-monitor pins (engine `monitors` JSON) ----
+  property var monitors: ({ outputs: [], stale: [], imageFit: "crop", globalFile: null })
+  // ---- live download progress (`download-status` JSON) ----
+  property bool applyingOnline: false
+  property var download: ({ active: false, downloaded: 0, total: null, percent: null })
+  // ---- MoeWalls hover preview ----
+  property string hoverKey: ""
+  property string previewKey: ""
+  property string previewPath: ""
+  property var previewCache: ({})
 
   readonly property string pluginId: (manifest && manifest.id) || "sebas.wallpaper-engine"
   readonly property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
@@ -106,7 +117,7 @@ Item {
   // Headless diagnostic: omarchy-shell shell call sebas.wallpaper-engine debugState '{}'
   // panelRev lets us verify from the CLI which revision of this file the
   // running shell actually loaded (bump on every Panel.qml change).
-  readonly property string panelRev: "2026-09-20-p20-envelope"
+  readonly property string panelRev: "2026-09-21-p21-monitors"
   function debugState() {
     var pls = []
     try {
@@ -154,6 +165,7 @@ Item {
     root.markedCount = 0
     // Boot through config first; the grid kicks off when config arrives
     // (see configProc), so the two requests never race each other.
+    // Monitor pins load silently alongside (sidebar block fills in).
     var s = root.startBusy("Loading…")
     configProc.command = [root.script, "config-get"]
     configProc.tag = s
@@ -161,19 +173,25 @@ Item {
     configProc.doneNotice = ""
     configProc.reloadGrid = false
     configProc.running = true
+    root.loadMonitors()
     Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
   }
 
   function close() {
     console.log("WE-PANEL close() called")
     root.serial += 1
-    var procs = [gridProc, searchProc, applyProc, configProc]
+    hoverTimer.stop()
+    var procs = [gridProc, searchProc, applyProc, configProc, downloadProc, previewProc, monitorsProc, monitorActProc]
     for (var i = 0; i < procs.length; i++) {
       if (procs[i].running) procs[i].running = false
     }
     root.opened = false
     root.loading = false
     root.busyText = ""
+    root.applyingOnline = false
+    root.hoverKey = ""
+    root.previewKey = ""
+    root.previewPath = ""
   }
 
   function dismiss() {
@@ -184,12 +202,17 @@ Item {
 
   function cancelLoad() {
     root.serial += 1
-    var procs = [gridProc, searchProc, applyProc, configProc]
+    hoverTimer.stop()
+    var procs = [gridProc, searchProc, applyProc, configProc, downloadProc, previewProc, monitorsProc, monitorActProc]
     for (var i = 0; i < procs.length; i++) {
       if (procs[i].running) procs[i].running = false
     }
     root.loading = false
     root.busyText = ""
+    root.applyingOnline = false
+    root.hoverKey = ""
+    root.previewKey = ""
+    root.previewPath = ""
     root.notice = "Cancelled"
   }
 
@@ -199,13 +222,18 @@ Item {
     // query + results, and never fire a default search — the grid stays
     // on its empty-state hint until the user types something.
     root.serial += 1
-    var procs = [gridProc, searchProc, applyProc]
+    hoverTimer.stop()
+    var procs = [gridProc, searchProc, applyProc, downloadProc, previewProc, monitorActProc]
     for (var i = 0; i < procs.length; i++) {
       if (procs[i].running) procs[i].running = false
     }
     if (configProc.running) configProc.tag = root.serial
     root.loading = false
     root.busyText = ""
+    root.applyingOnline = false
+    root.hoverKey = ""
+    root.previewKey = ""
+    root.previewPath = ""
     root.view = ({ section: section, name: name || "", provider: provider || "" })
     root.errorText = ""
     root.notice = ""
@@ -410,11 +438,14 @@ Item {
 
   function applySelected() {
     if (!root.selectedItem || root.loading) return
-    var s = root.startBusy(root.view.section === "online" || root.itemsSource.indexOf("online:") === 0
+    var online = root.view.section === "online" || root.itemsSource.indexOf("online:") === 0
+    var s = root.startBusy(online
       ? "Downloading full quality… (up to a minute for video)"
       : "Applying…")
     root.notice = ""
-    if (root.itemsSource.indexOf("online:") === 0)
+    root.applyingOnline = online
+    root.download = ({ active: false, downloaded: 0, total: null, percent: null })
+    if (online)
       applyProc.command = [root.script, "apply-key", root.selectedItem.key]
     else
       applyProc.command = [root.script, "set", root.selectedItem.key]
@@ -451,6 +482,76 @@ Item {
   function toggleFavorite(item) {
     if (!item || root.loading || root.view.section === "online") return
     mutate(["favorite-toggle", item.key], "", true)
+  }
+
+  function shortBase(p) {
+    if (!p) return ""
+    var base = String(p).split("/").pop().replace(/\.[^/.]+$/, "")
+    return base.length > 22 ? base.substring(0, 21) + "…" : base
+  }
+
+  function formatBytes(n) {
+    if (n === null || n === undefined || !isFinite(Number(n))) return "?"
+    n = Number(n)
+    if (n < 1024) return Math.floor(n) + " B"
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB"
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB"
+    return (n / 1073741824).toFixed(2) + " GB"
+  }
+
+  function downloadText() {
+    var d = root.download || {}
+    var base = root.formatBytes(d.downloaded || 0)
+    if (d.total) base += " / " + root.formatBytes(d.total)
+    if (d.percent !== null && d.percent !== undefined) base += " · " + d.percent + "%"
+    return base + " · " + root.busyElapsed + "s"
+  }
+
+  function cycleFitName(f) {
+    if (f === "crop") return "fit"
+    if (f === "fit") return "stretch"
+    return "crop"
+  }
+
+  // ---- per-monitor pins ----
+  function loadMonitors() {
+    var s = ++root.serial
+    monitorsProc.tag = s
+    monitorsProc.command = [root.script, "monitors"]
+    monitorsProc.running = true
+  }
+
+  function monitorAction(args, silent) {
+    var s = silent ? ++root.serial : root.startBusy("Saving…")
+    monitorActProc.tag = s
+    monitorActProc.command = [root.script].concat(args)
+    monitorActProc.running = true
+  }
+
+  // ---- live download progress ----
+  function pollDownload() {
+    if (!downloadProc.running) downloadProc.running = true
+  }
+
+  // ---- MoeWalls hover preview ----
+  function requestPreview(key) {
+    root.hoverKey = key || ""
+    if (!root.hoverKey) {
+      root.previewKey = ""
+      root.previewPath = ""
+      return
+    }
+    if (root.previewCache[root.hoverKey]) {
+      root.previewKey = root.hoverKey
+      root.previewPath = root.previewCache[root.hoverKey]
+      return
+    }
+    root.previewKey = ""
+    root.previewPath = ""
+    if (previewProc.running) previewProc.running = false
+    previewProc.wantKey = root.hoverKey
+    previewProc.command = [root.script, "preview-fetch", root.hoverKey]
+    previewProc.running = true
   }
 
   function mutate(args, doneNotice, wantGridReload) {
@@ -907,6 +1008,7 @@ Item {
     onExited: function(code) {
       if (applyProc.tag !== root.serial || !root.opened) return
       root.loading = false
+      root.applyingOnline = false
       root.busyText = ""
       if (code === 0) {
         root.errorText = ""
@@ -916,6 +1018,85 @@ Item {
         loadConfigSilent()
       } else {
         root.errorText = "Could not apply wallpaper"
+      }
+    }
+  }
+
+  // Live download progress: polled from the engine while apply-key runs.
+  Process {
+    id: downloadProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (!root.opened || !root.applyingOnline) return
+        var d = null
+        try { d = JSON.parse(String(text || "")) } catch (e) { d = null }
+        if (d && typeof d === "object") root.download = d
+      }
+    }
+  }
+
+  // MoeWalls hover preview: resolves a cached/streamable preview webm.
+  Process {
+    id: previewProc
+    property string wantKey: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (!root.opened || previewProc.wantKey === "" || previewProc.wantKey !== root.hoverKey) return
+        var p = String(text || "").trim()
+        if (p !== "" && p.charAt(0) === "/" && p.indexOf("\n") === -1) {
+          var next = {}
+          for (var k in root.previewCache) next[k] = root.previewCache[k]
+          next[previewProc.wantKey] = p
+          root.previewCache = next
+          if (root.hoverKey === previewProc.wantKey) {
+            root.previewKey = previewProc.wantKey
+            root.previewPath = p
+          }
+        }
+      }
+    }
+  }
+
+  // Per-monitor pins + global fit mode.
+  Process {
+    id: monitorsProc
+    property int tag: 0
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (monitorsProc.tag !== root.serial || !root.opened) return
+        var d = null
+        try { d = JSON.parse(String(text || "")) } catch (e) { d = null }
+        if (d && Array.isArray(d.outputs)) root.monitors = d
+      }
+    }
+  }
+
+  Process {
+    id: monitorActProc
+    property int tag: 0
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (monitorActProc.tag !== root.serial || !root.opened) return
+        var d = null
+        try { d = JSON.parse(String(text || "")) } catch (e) { d = null }
+        // monitor-set/clear/fit answer with fresh monitors JSON; config-set
+        // (imageFit) answers with config-get instead → just reload pins.
+        if (d && Array.isArray(d.outputs)) root.monitors = d
+        else root.loadMonitors()
+      }
+    }
+    onExited: function(code) {
+      if (monitorActProc.tag !== root.serial || !root.opened) return
+      root.loading = false
+      root.busyText = ""
+      if (code === 0) {
+        root.errorText = ""
+        loadConfigSilent()
+      } else if (root.errorText === "") {
+        root.errorText = "Monitor action failed"
       }
     }
   }
@@ -1006,6 +1187,26 @@ Item {
     running: root.opened && root.loading
     onTriggered: {
       root.busyElapsed = Math.floor(Date.now() / 1000) - root.busySince
+    }
+  }
+
+  // Live download progress while an online Apply is in flight.
+  Timer {
+    id: downloadPoller
+    interval: 500
+    repeat: true
+    running: root.opened && root.applyingOnline && applyProc.running
+    onTriggered: root.pollDownload()
+  }
+
+  // Hover preview debounce: wait until the cursor settles on a cell.
+  Timer {
+    id: hoverTimer
+    interval: 350
+    repeat: false
+    property string wantKey: ""
+    onTriggered: {
+      if (root.opened) root.requestPreview(hoverTimer.wantKey)
     }
   }
 
@@ -1438,6 +1639,134 @@ Item {
                   }
                 }
 
+                Text {
+                  textFormat: Text.PlainText
+                  text: "MONITORS"
+                  color: root.onScrimFaint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.topMargin: 10
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: "Pin one wallpaper per output — sticky over rotation."
+                  color: root.onScrimFaint
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Repeater {
+                  model: (root.monitors && root.monitors.outputs) || []
+
+                  ColumnLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: 2
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: 6
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: modelData.name + (modelData.connected === false ? " (off)" : "")
+                        color: root.onScrim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: (modelData.width || 0) + "×" + (modelData.height || 0)
+                        color: root.onScrimFaint
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                    }
+
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: modelData.file ? root.shortBase(modelData.file) : "Follows global"
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                    }
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: 4
+
+                      ActionButton {
+                        label: "Use current"
+                        enabled: !root.loading && !!(root.monitors && root.monitors.globalFile)
+                        onClicked: root.monitorAction(["monitor-set", modelData.name, root.monitors.globalFile])
+                      }
+                      ActionButton {
+                        label: modelData.fit || (root.monitors && root.monitors.imageFit) || "crop"
+                        enabled: !root.loading && !!modelData.file
+                        onClicked: root.monitorAction(["monitor-fit", modelData.name, root.cycleFitName(modelData.fit || (root.monitors && root.monitors.imageFit) || "crop")])
+                      }
+                      ActionButton {
+                        label: "✕"
+                        enabled: !root.loading && !!modelData.file
+                        onClicked: root.monitorAction(["monitor-clear", modelData.name])
+                      }
+                    }
+                  }
+                }
+
+                Repeater {
+                  model: (root.monitors && root.monitors.stale) || []
+
+                  RowLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "○ " + modelData.name + ": " + root.shortBase(modelData.file)
+                      color: root.onScrimFaint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      Layout.fillWidth: true
+                      elide: Text.ElideRight
+                    }
+                    ActionButton {
+                      label: "✕"
+                      enabled: !root.loading
+                      onClicked: root.monitorAction(["monitor-clear", modelData.name])
+                    }
+                  }
+                }
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: 6
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Default fit"
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    Layout.fillWidth: true
+                  }
+                  ActionButton {
+                    label: (root.monitors && root.monitors.imageFit) || "crop"
+                    enabled: !root.loading
+                    onClicked: root.monitorAction(["config-set", "imageFit", root.cycleFitName((root.monitors && root.monitors.imageFit) || "crop")])
+                  }
+                }
+
                 Item { Layout.fillHeight: true }
 
                 Text {
@@ -1722,7 +2051,7 @@ Item {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: root.busyText + "  " + root.busyElapsed + "s"
+                    text: root.applyingOnline && applyProc.running ? root.busyText : root.busyText + "  " + root.busyElapsed + "s"
                     color: root.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -1732,6 +2061,51 @@ Item {
                   ActionButton {
                     label: "Cancel"
                     onClicked: root.cancelLoad()
+                  }
+                }
+
+                // Determinate download progress while an online Apply runs
+                // (percent from `download-status`; unknown totals show an
+                // indeterminate bar with live MB instead of a fake number).
+                ColumnLayout {
+                  visible: root.applyingOnline && applyProc.running
+                  Layout.fillWidth: true
+                  spacing: 4
+
+                  Rectangle {
+                    Layout.fillWidth: true
+                    height: 6
+                    radius: 3
+                    color: root.softFill
+
+                    Rectangle {
+                      anchors.top: parent.top
+                      anchors.bottom: parent.bottom
+                      anchors.left: parent.left
+                      width: {
+                        var d = root.download || {}
+                        if (d.percent === null || d.percent === undefined) return parent.width
+                        var f = Number(d.percent) / 100
+                        if (!isFinite(f) || f < 0) f = 0
+                        if (f > 1) f = 1
+                        return parent.width * f
+                      }
+                      opacity: {
+                        var d2 = root.download || {}
+                        return (d2.percent === null || d2.percent === undefined) ? 0.35 : 1
+                      }
+                      radius: 3
+                      color: root.accent
+                    }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.downloadText()
+                    color: root.onScrimFaint
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    Layout.fillWidth: true
                   }
                 }
               }
@@ -1778,6 +2152,43 @@ Item {
                           asynchronous: true
                           cache: true
                           smooth: true
+                        }
+
+                        // MoeWalls hover preview: settling the cursor on a
+                        // LIVE cell fetches the small preview webm
+                        // (cached) and plays it over the thumbnail —
+                        // nothing downloads until Apply.
+                        MediaPlayer {
+                          id: cellPreviewPlayer
+                          autoPlay: true
+                          loops: MediaPlayer.Infinite
+                          videoOutput: cellPreviewOut
+                          audioOutput: AudioOutput { muted: true }
+                          source: (root.previewKey === modelData.key && root.previewPath !== "")
+                            ? "file://" + root.previewPath : ""
+                        }
+
+                        VideoOutput {
+                          id: cellPreviewOut
+                          anchors.top: parent.top
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          height: parent.height - 32
+                          fillMode: VideoOutput.PreserveAspectCrop
+                          visible: root.previewKey === modelData.key && root.previewPath !== ""
+                        }
+
+                        HoverHandler {
+                          id: cellHover
+                          onHoveredChanged: {
+                            if (!cellHover.hovered) {
+                              if (hoverTimer.running && hoverTimer.wantKey === modelData.key) hoverTimer.stop()
+                              if (root.hoverKey === modelData.key) root.requestPreview("")
+                            } else if (modelData.preview) {
+                              hoverTimer.wantKey = modelData.key
+                              hoverTimer.restart()
+                            }
+                          }
                         }
 
                         Rectangle {
@@ -1935,7 +2346,9 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
                 text: root.view.section === "online"
-                  ? "Search to browse. Results download on Apply."
+                  ? (root.view.provider === "moewalls"
+                    ? "Search to browse. Hover a LIVE result to preview — Apply downloads."
+                    : "Search to browse. Results download on Apply.")
                   : (root.view.section === "playlist"
                     ? "Empty playlist — use Select in Library to add some."
                     : root.view.section === "favorites"

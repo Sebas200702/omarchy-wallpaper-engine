@@ -25,12 +25,21 @@ wallhaven_search() {
 
 # Download a wallhaven full image to dest (validates content-type + size).
 # Usage: wallhaven_download <full_url> <dest> <max_bytes>
+# When DOWNLOAD_PROGRESS_LABEL is set (apply-key path), the download is
+# tracked for `download-status`/panel progress bar; otherwise unchanged.
 wallhaven_download() {
   local full_url="$1" dest="$2" max_bytes="${3:-52428800}"
-  local tmp ctype size
+  local tmp ctype size total=""
   [[ $full_url == https://w.wallhaven.cc/* ]] || return 1
   tmp=$(mktemp -p "$(dirname "$dest")" .wh.XXXXXX) || return 1
-  if ! run_curl_killable -sSL --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
+  if [[ -n ${DOWNLOAD_PROGRESS_LABEL:-} ]]; then
+    total=$(head_content_length "$full_url")
+    write_download_progress 0 "$total" "$DOWNLOAD_PROGRESS_LABEL"
+    if ! run_curl_tracked "$DOWNLOAD_PROGRESS_LABEL" "$total" "$tmp" -- \
+        -sSL --fail --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
+      rm -f "$tmp"; return 1
+    fi
+  elif ! run_curl_killable -sSL --fail --proto '=https' --max-redirs 3 -m 60 -A "omarchy-wallpaper-engine/0.1" -o "$tmp" "$full_url"; then
     rm -f "$tmp"; return 1
   fi
   ctype=$(file -b --mime-type "$tmp" 2>/dev/null)
