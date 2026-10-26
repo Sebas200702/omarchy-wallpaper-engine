@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "sebas.wallpaper-engine",
-  "name": "Wallpaper Engine",
-  "version": "0.3.0",
+  "name": "WallHub",
+  "version": "0.4.0",
   "author": "sebas",
   "license": "MIT",
-  "description": "Rotating wallpaper engine: local images+videos with timed shuffle, playlists, favorites, schedules, battery/idle-aware playback, and online search (Wallhaven + MoeWalls).",
+  "description": "WallHub — wallpaper hub: local images+videos with timed shuffle, playlists, favorites, schedules, per-monitor pins, battery/idle-aware playback, and online search (Wallhaven + MoeWalls + Steam Workshop).",
   "kinds": [
     "service",
     "bar-widget",
@@ -17,7 +17,7 @@
     "panel": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Wallpaper Engine",
+    "displayName": "WallHub",
     "category": "Background",
     "allowMultiple": false,
     "defaultSection": "right"

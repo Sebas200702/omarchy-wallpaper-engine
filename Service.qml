@@ -568,7 +568,16 @@ Item {
       exclusionMode: ExclusionMode.Ignore
 
       WlrLayershell.namespace: "sebas-wallpaper-engine"
-      WlrLayershell.layer: WlrLayer.Background
+      // Must be Bottom, not Background: omarchy's static-wallpaper layer
+      // (namespace "omarchy-background") also lives on WlrLayer.Background,
+      // and Hyprland stacks same-layer surfaces by map order (newest on
+      // top). Whenever the background layer remaps after this one it lands
+      // above the video and hides it — the video keeps decoding but the
+      // desktop looks frozen. Bottom sits above every Background surface
+      // (so it always covers the static wallpaper) yet still below normal
+      // windows and the bar. Verified against Hyprland's render order:
+      // background → bottom → windows → top → overlay.
+      WlrLayershell.layer: WlrLayer.Bottom
       WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
 
       MediaPlayer {
