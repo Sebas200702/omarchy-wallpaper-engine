@@ -108,6 +108,9 @@ steamcmd. Extra folders go in `workshopDirs`.
 - **Videos** work out of the box: applying one hard-links it into
   `backgrounds/<theme>/workshop/`, so it then rotates, favorites and pins
   like any wallpaper.
+- **Bundled sample scenes** that ship with the Wallpaper Engine app
+  (`projects/defaultprojects`: Beach, Dino Run, Deep Space…) are listed too,
+  so scenes work without subscribing to anything.
 - **Scenes and web wallpapers** need
   [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
   (AUR `linux-wallpaperengine-git`) plus the Wallpaper Engine assets
@@ -259,8 +262,9 @@ Removal stops playback, restores last static wallpaper, removes menu override an
   output-agnostic (one layer per `Quickshell.screens` entry), but only
   verified on one screen so far — multi-monitor feedback welcome.
 - **No per-playlist schedules** — schedules are global `HH:MM` slots.
-- **Scenes are verified against a stand-in renderer only** (command line,
-  freeze/thaw, properties); real linux-wallpaperengine feedback welcome.
+- **Scene properties depend on linux-wallpaperengine**: some (e.g.
+  script-driven combos like Dino Run's level) are ignored by the renderer
+  itself even when passed with `--set-property`.
 - Workshop `application` items are not supported.
 
 ## Credits

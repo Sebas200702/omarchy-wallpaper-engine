@@ -221,6 +221,9 @@ play_scene_ipc() {
 
 # parse_lwe_properties — stdin: --list-properties text; stdout: JSON array
 # of {name, type, label, value, min, max, step, options[{label,value}], color}.
+# Accepts both the README format (Description:/Minimum value:/combolist
+# "label -> value"/"R: G: B:") and the shipping r6xx format (Text:/Min:/
+# combo "value = Label"/comma-separated color values).
 parse_lwe_properties() {
   awk '
     function flush() {
@@ -228,28 +231,37 @@ parse_lwe_properties() {
       printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, type, label, value, min, max, step, opts, color
       name = ""; type = ""; label = ""; value = ""; min = ""; max = ""; step = ""; opts = ""; color = ""
     }
+    function rest(line, prefix) { sub(prefix, "", line); return line }
     /^[A-Za-z0-9_]+ - [a-z]+[[:space:]]*$/ {
       flush(); split($0, p, " - "); name = p[1]; type = p[2]; sub(/[[:space:]]+$/, "", type); inopts = 0; next
     }
     name == "" { next }
-    /^[[:space:]]+Description:/ { sub(/^[[:space:]]+Description:[[:space:]]*/, ""); label = $0; next }
-    /^[[:space:]]+Value:/ { sub(/^[[:space:]]+Value:[[:space:]]*/, ""); value = $0; next }
-    /^[[:space:]]+Minimum value:/ { sub(/^[[:space:]]+Minimum value:[[:space:]]*/, ""); min = $0; next }
-    /^[[:space:]]+Maximum value:/ { sub(/^[[:space:]]+Maximum value:[[:space:]]*/, ""); max = $0; next }
-    /^[[:space:]]+Step:/ { sub(/^[[:space:]]+Step:[[:space:]]*/, ""); step = $0; next }
-    /^[[:space:]]+Pos+ible values:/ { inopts = 1; next }
-    /^[[:space:]]+R: / { c = $0; sub(/^[[:space:]]+/, "", c); color = c; next }
-    inopts && /->/ { o = $0; sub(/^[[:space:]]+/, "", o); opts = opts (opts == "" ? "" : "|") o; next }
+    /^[[:space:]]+(Description|Text):/ { label = rest($0, "^[[:space:]]+(Description|Text):[[:space:]]*"); next }
+    /^[[:space:]]+Value:/ { value = rest($0, "^[[:space:]]+Value:[[:space:]]*"); sub(/[[:space:]]+$/, "", value); next }
+    /^[[:space:]]+(Minimum value|Min):/ { min = rest($0, "^[[:space:]]+(Minimum value|Min):[[:space:]]*"); next }
+    /^[[:space:]]+(Maximum value|Max):/ { max = rest($0, "^[[:space:]]+(Maximum value|Max):[[:space:]]*"); next }
+    /^[[:space:]]+Step:/ { step = rest($0, "^[[:space:]]+Step:[[:space:]]*"); next }
+    /^[[:space:]]*(Pos+ible values|Values):/ { inopts = 1; next }
+    /^[[:space:]]+R: / { color = rest($0, "^[[:space:]]+"); next }
+    inopts && / -> / { o = rest($0, "^[[:space:]]+"); split(o, q, " -> "); opts = opts (opts == "" ? "" : "|") q[1] "\034" q[2]; next }
+    inopts && / = / { o = rest($0, "^[[:space:]]+"); i = index(o, " = "); opts = opts (opts == "" ? "" : "|") substr(o, i + 3) "\034" substr(o, 1, i - 1); next }
     END { flush() }
   ' | jq -R -s '
+    def human: gsub("<[^>]*>"; "") | sub("^ui_(editor|browse)_properties_"; "") | gsub("_"; " ")
+      | if length > 0 then (.[0:1] | ascii_upcase) + .[1:] else . end;
     [split("\n")[] | select(length > 0) | split("\t") | {
-      name: .[0], type: .[1],
-      label: (.[2] | gsub("<[^>]*>"; "") | if . == "" then null else . end),
+      name: .[0],
+      type: (if .[1] == "combo" then "combolist" else .[1] end),
+      label: (.[2] | human | if . == "" then null else . end),
       value: (.[3] | if . == "" then null else . end),
       min: (.[4] | tonumber? // null), max: (.[5] | tonumber? // null), step: (.[6] | tonumber? // null),
-      options: (.[7] | if . == "" then [] else (split("|") | map(split(" -> ") | {label: .[0], value: .[1]})) end),
-      color: (.[8] | if . == "" then null else . end)
-    }]'
+      options: (.[7] | if . == "" then [] else (split("|") | map(split("\u001c") | {label: .[0], value: .[1]})) end),
+      color: (if .[8] != "" then .[8]
+              elif .[1] == "color" and .[3] != "" then (.[3] | split(",") | map(gsub(" "; "")) | "R: \(.[0]) G: \(.[1]) B: \(.[2])")
+              else null end)
+    }]
+    # color values are not editable here; keep the swatch, drop the raw value
+    | map(if .type == "color" then .value = null else . end)'
 }
 
 # workshop_properties <id> — scene properties merged with saved overrides.

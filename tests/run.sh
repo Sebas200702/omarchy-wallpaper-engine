@@ -709,6 +709,14 @@ assert_eq "parse_lwe_properties: slider range" "16 64 1" "$(jq -r '.[0] | "\(.mi
 assert_eq "parse_lwe_properties: combolist options" "32=2" "$(jq -r '.[2].options[1] | "\(.label)=\(.value)"' <<<"$pj")"
 assert_eq "parse_lwe_properties: color components" "R: 0.14902 G: 0.23137 B: 0.4 A: 1" "$(jq -r '.[3].color' <<<"$pj")"
 assert_eq "parse_lwe_properties: strips markup from labels" "Add Visualizer" "$(jq -r '.[4].label' <<<"$pj")"
+# linux-wallpaperengine r627 (what the AUR package actually prints)
+props_real=$'dino - combo\n\tText: Dino\n\tValue: vita\nValues: \n\t\tdoux = Doux\n\t\tvita = Vita\n\nschemecolor - color\n\tText: ui_browse_properties_scheme_color\n\tValue: 0.282353, 0.501961, 0.094118, 1.000000\n\nui_editor_properties_speed - slider\n\tText: ui_editor_properties_speed\n\tMin: -1\n\tMax: 1\n\tStep: 0.1\n\tValue: 0.300000\n'
+pr=$(printf '%s\n' "$props_real" | scall "$(new_testhome)" parse_lwe_properties)
+assert_eq "parse_lwe_properties (r627): combo becomes combolist with value/label" "combolist vita Vita" \
+  "$(jq -r '.[0] | "\(.type) \(.options[1].value) \(.options[1].label)"' <<<"$pr")"
+assert_eq "parse_lwe_properties (r627): comma color becomes a swatch" "R: 0.282353 G: 0.501961 B: 0.094118" "$(jq -r '.[1].color' <<<"$pr")"
+assert_eq "parse_lwe_properties (r627): Min/Max/Step + humanized label" "-1 1 0.1 Speed" \
+  "$(jq -r '.[2] | "\(.min) \(.max) \(.step) \(.label)"' <<<"$pr")"
 
 thp=$(new_testhome)
 assert_rc "scene_prop_set: stores a plain override" 0 "$(scall "$thp" scene_prop_set 222222 bloom 1; echo $?)"
