@@ -145,6 +145,34 @@ clear_scene_state() {
   rm -f "$scene_state"
 }
 
+# fullscreen_outputs_from <monitors_json> <clients_json> <ignore_json> —
+# names of outputs whose visible workspace (regular or special) holds a
+# real fullscreen client (Hyprland mode 2; maximize is mode 1) whose
+# class/initialClass does not contain an ignored substring.
+fullscreen_outputs_from() {
+  jq -cn --argjson mons "$1" --argjson clients "$2" --argjson ignore "$3" '
+    ($ignore | map(ascii_downcase | select(length > 0))) as $ign
+    | [$mons[] | . as $m
+       | select(any($clients[];
+           (.workspace.id == $m.activeWorkspace.id or .workspace.id == ($m.specialWorkspace.id // -99999))
+           and ((.fullscreen // 0) == 2)
+           and ((((.class // "") + " " + (.initialClass // "")) | ascii_downcase) as $c
+                | all($ign[]; ($c | contains(.)) | not))))
+       | .name]'
+}
+
+# fullscreen_outputs — live version for the service (config: pauseOnFullscreen,
+# fullscreenIgnore[]); prints [] when disabled or outside Hyprland.
+fullscreen_outputs() {
+  local mons clients ignore
+  [[ $(cfg '.pauseOnFullscreen' 'true') == false ]] && { echo '[]'; return 0; }
+  mons=$(timeout 3 hyprctl -j monitors 2>/dev/null) || { echo '[]'; return 0; }
+  clients=$(timeout 3 hyprctl -j clients 2>/dev/null) || { echo '[]'; return 0; }
+  ignore=$(jq -c '[.fullscreenIgnore[]? | strings] | .[0:32]' "$user_config" 2>/dev/null) || ignore='[]'
+  [[ -n $ignore ]] || ignore='[]'
+  fullscreen_outputs_from "$mons" "$clients" "$ignore" 2>/dev/null || echo '[]'
+}
+
 ensure_secure_dir() {
   local dir="$1"
   [[ -L "$dir" ]] && { echo "refusing symlinked dir: $dir" >&2; return 1; }
@@ -2193,6 +2221,7 @@ case "${1:-}" in
   scene-prop-set) scene_prop_set "${2:-}" "${3:-}" "${4:-}" ;;
   scene-prop-reset) scene_prop_reset "${2:-}" ;;
   doctor) if [[ ${2:-} == --json ]]; then doctor_json; else doctor_text; fi ;;
+  fullscreen-outputs) fullscreen_outputs ;;
   schedules) schedules_json ;;
   schedule-add) schedule_add "${2:-}" "${3:-}" ;;
   schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;

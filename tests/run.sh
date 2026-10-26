@@ -711,5 +711,19 @@ assert_eq "doctor_json: reports every check with a known status" "true" \
   "$(jq '(length >= 8) and all(.[]; .status | IN("ok","warn","fail","info"))' <<<"$dj")"
 assert_eq "doctor_json: warns that scenes need linux-wallpaperengine" "warn" "$(jq -r '.[] | select(.id=="lwe") | .status' <<<"$dj")"
 
+# ---- fullscreen_outputs_from (Hyprland: mode 2 = fullscreen, 1 = maximize) ----
+fs_mons='[{"name":"eDP-1","activeWorkspace":{"id":2},"specialWorkspace":{"id":0}},{"name":"HDMI-A-1","activeWorkspace":{"id":5},"specialWorkspace":{"id":-98}}]'
+thf=$(new_testhome)
+assert_eq "fullscreen_outputs_from: maximized windows do not pause" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"foot","workspace":{"id":2},"fullscreen":1}]' '[]')"
+assert_eq "fullscreen_outputs_from: a fullscreen client pauses its output only" '["eDP-1"]' \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"steam_app_1","workspace":{"id":2},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: fullscreen on a hidden workspace is ignored" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"mpv","workspace":{"id":9},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: special workspace counts" '["HDMI-A-1"]' \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"mpv","workspace":{"id":-98},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: ignore list matches class substrings" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"org.Chromium","initialClass":"chromium","workspace":{"id":2},"fullscreen":2}]' '["chromium"]')"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
