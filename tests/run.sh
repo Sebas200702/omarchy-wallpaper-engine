@@ -79,6 +79,7 @@ scall() {
     set -- --help
     source "$scriptpath" >/dev/null 2>&1
     source "$provider" >/dev/null 2>&1
+    source "${provider%/*}/workshop.sh" >/dev/null 2>&1
     "$fn" "${args[@]}"
   ' _ "$ENGINE" "$SCRIPT_DIR/providers/steam.sh" "$fn" "$@"
 }
@@ -641,6 +642,74 @@ assert_eq "steam_login: stdin pipe stores steamUser" \
 th29=$(steam_login_home)
 rc29=0; msg29=$(scall "$th29" steam_login "bad/name" 2>&1 1>/dev/null) || rc29=$?
 assert_rc "steam_login: hostile username rejected" 1 "$rc29"
+
+# ---- local Workshop library (providers/workshop.sh) ----
+# Fixture: two Steam libraries (the second only reachable through
+# libraryfolders.vdf), one item of each type, plus a hostile project.json
+# whose "file" tries to escape the item dir.
+wk_home() {
+  local th lib1 lib2
+  th=$(new_testhome)
+  lib1="$th/.local/share/Steam/steamapps/workshop/content/431960"
+  lib2="$th/games/SteamLibrary/steamapps/workshop/content/431960"
+  mkdir -p "$lib1/111111" "$lib1/222222" "$lib2/333333" "$lib2/444444" "$th/.local/share/Steam/steamapps"
+  printf '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' \
+    "$th/.local/share/Steam" "$th/games/SteamLibrary" >"$th/.local/share/Steam/steamapps/libraryfolders.vdf"
+  printf 'fakevideo' >"$lib1/111111/clip one.mp4"; printf 'img' >"$lib1/111111/preview.jpg"
+  printf '{"title":"Video One","type":"Video","file":"clip one.mp4","preview":"preview.jpg"}' >"$lib1/111111/project.json"
+  printf '{"title":"Scene Two","type":"scene","file":"scene.json","preview":"preview.gif"}' >"$lib1/222222/project.json"
+  printf '{"title":"Web Three","type":"web","file":"index.html"}' >"$lib2/333333/project.json"
+  printf '{"title":"Evil","type":"video","file":"../../../../etc/passwd","preview":"../x.jpg"}' >"$lib2/444444/project.json"
+  printf '%s' "$th"
+}
+thw=$(wk_home)
+wl=$(scall "$thw" workshop_list_json)
+assert_eq "workshop_list_json: finds items across libraryfolders.vdf libraries" "4" "$(jq 'length' <<<"$wl")"
+assert_eq "workshop_list_json: maps types to kinds" "video,scene,web,video" \
+  "$(jq -r '. as $all | ["111111","222222","333333","444444"] | map(. as $i | $all[] | select(.workshopId == $i) | .kind) | join(",")' <<<"$wl")"
+assert_eq "workshop_list_json: video is playable" "true" "$(jq -r '.[] | select(.workshopId=="111111") | .playable' <<<"$wl")"
+assert_eq "workshop_list_json: scene without linux-wallpaperengine is blocked" "needs-lwe" \
+  "$(jq -r '.[] | select(.workshopId=="222222") | .reason' <<<"$wl")"
+assert_eq "workshop_list_json: hostile file path stays inside the item dir" \
+  "$thw/games/SteamLibrary/steamapps/workshop/content/431960/444444/passwd" \
+  "$(jq -r '.[] | select(.workshopId=="444444") | .file' <<<"$wl")"
+assert_eq "workshop_list_json: hostile preview path stays inside the item dir" \
+  "$thw/games/SteamLibrary/steamapps/workshop/content/431960/444444/x.jpg" \
+  "$(jq -r '.[] | select(.workshopId=="444444") | .thumb' <<<"$wl")"
+assert_rc "workshop_item_dir: rejects a non-numeric id" 1 "$(scall "$thw" workshop_item_dir "../111111" >/dev/null 2>&1; echo $?)"
+lib1w="$thw/.local/share/Steam/steamapps/workshop/content/431960"
+imp=$(scall "$thw" workshop_import_video "$lib1w/111111" "$lib1w/111111/clip one.mp4" 111111 "Video One")
+assert_eq "workshop_import_video: lands in backgrounds/workshop as wk-<id>" \
+  "$thw/.config/omarchy/backgrounds/workshop/wk-111111.mp4" "$imp"
+assert_eq "workshop_import_video: writes a workshop attribution sidecar" "workshop" \
+  "$(jq -r '.provider' "$imp.attribution.json" 2>/dev/null)"
+assert_rc "workshop_import_video: refuses a file outside the item dir" 1 \
+  "$(scall "$thw" workshop_import_video "$lib1w/111111" "/etc/hostname" 111111 "x" >/dev/null 2>&1; echo $?)"
+assert_rc "workshop_is_item_dir: accepts a real item dir" 0 "$(scall "$thw" workshop_is_item_dir "$lib1w/222222"; echo $?)"
+assert_rc "workshop_is_item_dir: rejects a path outside Workshop roots" 1 "$(scall "$thw" workshop_is_item_dir "$thw"; echo $?)"
+
+# ---- linux-wallpaperengine --list-properties parser (README sample) ----
+props_sample=$'barcount - slider\n\tDescription: Bar Count\n\tValue: 64\n\tMinimum value: 16\n\tMaximum value: 64\n\tStep: 1\n\nbloom - boolean\n\tDescription: Bloom\n\tValue: 0\nfrequency - combolist\n\tDescription: Frequency\n\tValue: 2\n\t\tPosible values:\n\t\t16 -> 1\n\t\t32 -> 2\n\t\t64 -> 3\n\nschemecolor - color\n\tDescription: ui_browse_properties_scheme_color\n\tR: 0.14902 G: 0.23137 B: 0.4 A: 1\nvisualizer - boolean\n\tDescription: <hr>Add Visualizer<hr>\n\tValue: 1'
+pj=$(printf '%s\n' "$props_sample" | scall "$(new_testhome)" parse_lwe_properties)
+assert_eq "parse_lwe_properties: one entry per property" "5" "$(jq 'length' <<<"$pj")"
+assert_eq "parse_lwe_properties: slider range" "16 64 1" "$(jq -r '.[0] | "\(.min) \(.max) \(.step)"' <<<"$pj")"
+assert_eq "parse_lwe_properties: combolist options" "32=2" "$(jq -r '.[2].options[1] | "\(.label)=\(.value)"' <<<"$pj")"
+assert_eq "parse_lwe_properties: color components" "R: 0.14902 G: 0.23137 B: 0.4 A: 1" "$(jq -r '.[3].color' <<<"$pj")"
+assert_eq "parse_lwe_properties: strips markup from labels" "Add Visualizer" "$(jq -r '.[4].label' <<<"$pj")"
+
+thp=$(new_testhome)
+assert_rc "scene_prop_set: stores a plain override" 0 "$(scall "$thp" scene_prop_set 222222 bloom 1; echo $?)"
+assert_eq "scene_prop_set: override saved under the item id" "1" "$(jq -r '.sceneProperties["222222"].bloom' "$thp/.config/omarchy/wallpaper-engine.json")"
+assert_rc "scene_prop_set: rejects shell metacharacters" 1 "$(scall "$thp" scene_prop_set 222222 bloom '$(reboot)'; echo $?)"
+assert_rc "scene_prop_set: rejects a hostile property name" 1 "$(scall "$thp" scene_prop_set 222222 'a=b' 1; echo $?)"
+scall "$thp" scene_prop_reset 222222 >/dev/null 2>&1
+assert_eq "scene_prop_reset: drops the item's overrides" "null" "$(jq -r '.sceneProperties["222222"]' "$thp/.config/omarchy/wallpaper-engine.json")"
+
+# ---- doctor ----
+dj=$(scall "$thw" doctor_json 2>/dev/null)
+assert_eq "doctor_json: reports every check with a known status" "true" \
+  "$(jq '(length >= 8) and all(.[]; .status | IN("ok","warn","fail","info"))' <<<"$dj")"
+assert_eq "doctor_json: warns that scenes need linux-wallpaperengine" "warn" "$(jq -r '.[] | select(.id=="lwe") | .status' <<<"$dj")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

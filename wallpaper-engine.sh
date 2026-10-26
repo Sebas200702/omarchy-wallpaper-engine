@@ -22,6 +22,8 @@ readonly history_state="$state_dir/history"
 readonly lastchange_state="$state_dir/last-change"
 readonly paused_state="$state_dir/paused"
 readonly current_state="$state_dir/current"
+# Workshop scene/web dir handed to linux-wallpaperengine (providers/workshop.sh).
+readonly scene_state="$state_dir/scene"
 readonly online_meta="$state_dir/online-meta.tsv"
 readonly download_progress="$state_dir/download.progress"
 readonly preview_cache_name="previews"
@@ -137,6 +139,11 @@ run_curl_tracked() {
 [[ -f "$plugin_dir/providers/wallhaven.sh" ]] && source "$plugin_dir/providers/wallhaven.sh"
 [[ -f "$plugin_dir/providers/moewalls.sh" ]] && source "$plugin_dir/providers/moewalls.sh"
 [[ -f "$plugin_dir/providers/steam.sh" ]] && source "$plugin_dir/providers/steam.sh"
+[[ -f "$plugin_dir/providers/workshop.sh" ]] && source "$plugin_dir/providers/workshop.sh"
+
+clear_scene_state() {
+  rm -f "$scene_state"
+}
 
 ensure_secure_dir() {
   local dir="$1"
@@ -535,7 +542,7 @@ pop_queue() {
 
 push_history() {
   local f="$1"
-  [[ -n $f ]] || return 0
+  [[ -n $f && -f $f ]] || return 0
   touch "$history_state" 2>/dev/null
   { printf '%s\n' "$f"; cat "$history_state" 2>/dev/null; } | head -n 20 >"$history_state.new"
   mv -f "$history_state.new" "$history_state"
@@ -655,6 +662,7 @@ apply_file() {
   file=$(readlink -f "$file") || return 1
   [[ -s $current_state ]] && prev=$(<"$current_state") || prev=""
   [[ -n $prev && $prev != "$file" ]] && push_history "$prev"
+  clear_scene_state
   if is_video "$file"; then
     poster=$(thumbnail_for_video "$file") || { omarchy-notification-send "Could not read video file" -t 2000; return 1; }
     [[ -L "$state_dir" ]] && return 1
@@ -684,6 +692,7 @@ apply_file() {
 
 restore_static_background() {
   local fallback=""
+  clear_scene_state
   stop_video_ipc
   [[ -L "$fallback_state" ]] && rm -f "$fallback_state" || { [[ -s $fallback_state ]] && fallback=$(<"$fallback_state"); }
   [[ -z $fallback || ! -f $fallback ]] && fallback=$(first_static_background)
@@ -693,6 +702,14 @@ restore_static_background() {
 
 resume_engine() {
   [[ -L "$video_state" || -L "$poster_state" ]] && { rm -f "$video_state" "$poster_state"; return 0; }
+  if [[ -s $scene_state && ! -L $scene_state ]] && declare -F workshop_is_item_dir >/dev/null; then
+    local scene
+    scene=$(<"$scene_state")
+    if workshop_is_item_dir "$scene" && lwe_bin >/dev/null 2>&1; then
+      play_scene_ipc "$scene" && return 0
+    fi
+    clear_scene_state
+  fi
   if [[ -s $video_state && -s $poster_state ]]; then
     local video poster
     video=$(<"$video_state"); poster=$(<"$poster_state")
@@ -731,8 +748,9 @@ stop_if_changed() {
   current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
   expected=$(<"$expected_state")
   [[ -n $current && $current == "$expected" ]] && return 0
-  # manual override → stop video if poster changed, adopt new current, reset timer
+  # manual override → stop video/scene if poster changed, adopt new current, reset timer
   stop_video_ipc
+  clear_scene_state
   rm -f "$video_state" "$poster_state"
   atomic_write "$expected_state" "$current"
   atomic_write "$current_state" "$current"
@@ -905,11 +923,12 @@ do_prev() {
   prev=$(head -n 1 "$history_state")
   tail -n +2 "$history_state" >"$history_state.new" && mv -f "$history_state.new" "$history_state"
   [[ -s $current_state ]] && cur=$(<"$current_state") || cur=""
-  # put current back at queue front
-  if [[ -n $cur ]]; then
+  # put current back at queue front (scene dirs are not queueable)
+  if [[ -n $cur && -f $cur ]]; then
     { printf '%s\n' "$cur"; cat "$queue_state" 2>/dev/null; } >"$queue_state.new" && mv -f "$queue_state.new" "$queue_state"
   fi
   # apply without pushing history again
+  clear_scene_state
   local file="$prev" transition_ms
   transition_ms=$(cfg '.transitionMs' '420')
   validate_wallpaper_path "$file" || return 1
@@ -937,7 +956,12 @@ do_prev() {
 do_status() {
   local cur="" kind="none" active=false paused=false next_in="" queue_len=0 last now interval next_sched="" playlist=""
   [[ -s $current_state ]] && cur=$(<"$current_state")
-  if [[ -n $cur ]]; then is_video "$cur" && kind="video" || kind="image"; active=true; fi
+  if [[ -n $cur ]]; then
+    if [[ -s $scene_state && $(<"$scene_state") == "$cur" ]]; then kind="scene"
+    elif is_video "$cur"; then kind="video"
+    else kind="image"; fi
+    active=true
+  fi
   [[ -f $paused_state && $(<"$paused_state") == 1 ]] && paused=true
   [[ $(cfg '.enabled' 'true') != true ]] && paused=true
   queue_len=0
@@ -2091,6 +2115,10 @@ WallHub (wallpaper-engine.sh) — usage:
   wallpaper-engine.sh schedules | schedule-add <HH:MM> <pick> | schedule-remove <HH:MM> [pick]
   wallpaper-engine.sh monitors | monitor-set <output> <file> | monitor-clear <output> | monitor-fit <output> <crop|fit|stretch>
     # per-monitor pins: sticky over rotation, shown with per-output fit mode
+  wallpaper-engine.sh workshop-list | workshop-apply <id> | workshop-properties <id>
+  wallpaper-engine.sh scene-prop-set <id> <name> <value> | scene-prop-reset <id>
+    # local Steam Workshop library (no login); scenes/web need linux-wallpaperengine
+  wallpaper-engine.sh doctor [--json]   # environment checks
   wallpaper-engine.sh download-status | preview-fetch <key>
     # live download progress (polled by the panel) + cached hover previews
   wallpaper-engine.sh online-status | online-clear [--all]
@@ -2157,6 +2185,14 @@ case "${1:-}" in
   monitor-fit) monitor_fit "${2:-}" "${3:-}" ;;
   download-status) download_status ;;
   preview-fetch) preview_fetch "${2:-}" ;;
+  workshop-list) workshop_list_json ;;
+  workshop-apply)
+    [[ ${2:-} =~ ^[0-9]{3,20}$ ]] || { echo "usage: workshop-apply <id>" >&2; exit 1; }
+    workshop_apply "$2" && cat "$current_state" ;;
+  workshop-properties) workshop_properties "${2:-}" ;;
+  scene-prop-set) scene_prop_set "${2:-}" "${3:-}" "${4:-}" ;;
+  scene-prop-reset) scene_prop_reset "${2:-}" ;;
+  doctor) if [[ ${2:-} == --json ]]; then doctor_json; else doctor_text; fi ;;
   schedules) schedules_json ;;
   schedule-add) schedule_add "${2:-}" "${3:-}" ;;
   schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;
