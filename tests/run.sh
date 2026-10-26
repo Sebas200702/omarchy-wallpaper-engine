@@ -68,6 +68,40 @@ call_rc() {
   call "$@" >/dev/null 2>&1
 }
 
+scall() {
+  # scall <testhome> <function> [args...] — like call, but also sources
+  # providers/steam.sh, whose functions the engine only loads from the real
+  # plugin dir (absent in the isolated testhome).
+  local testhome="$1" fn="$2"; shift 2
+  env -i PATH="/usr/bin:/bin" HOME="$testhome" bash -c '
+    scriptpath="$1"; provider="$2"; fn="$3"; shift 3
+    args=("$@")
+    set -- --help
+    source "$scriptpath" >/dev/null 2>&1
+    source "$provider" >/dev/null 2>&1
+    "$fn" "${args[@]}"
+  ' _ "$ENGINE" "$SCRIPT_DIR/providers/steam.sh" "$fn" "$@"
+}
+
+scall_rc() {
+  scall "$@" >/dev/null 2>&1
+}
+
+scall_env() {
+  # scall_env "<VAR=val ...>" <testhome> <function> [args...] — scall with
+  # extra environment (steam_login's WE_STEAM_PASS panel-login path).
+  local extra="$1" testhome="$2" fn="$3"; shift 3
+  # shellcheck disable=SC2086
+  env -i PATH="/usr/bin:/bin" HOME="$testhome" $extra bash -c '
+    scriptpath="$1"; provider="$2"; fn="$3"; shift 3
+    args=("$@")
+    set -- --help
+    source "$scriptpath" >/dev/null 2>&1
+    source "$provider" >/dev/null 2>&1
+    "$fn" "${args[@]}"
+  ' _ "$ENGINE" "$SCRIPT_DIR/providers/steam.sh" "$fn" "$@"
+}
+
 assert_eq() {
   local desc="$1" expected="$2" actual="$3"
   if [[ $expected == "$actual" ]]; then
@@ -406,6 +440,176 @@ printf '/c/moe-abc.jpg\tmoewalls\ttok\tpage\ttitle\thttps://moewalls.com/pv.webm
 assert_eq "preview_fetch: cache hit returns the webm path" \
   "$th17/.cache/omarchy/wallpaper-engine/online/previews/moe-abc.webm" \
   "$(call "$th17" preview_fetch "/c/moe-abc.jpg")"
+
+# ---- rank_moe_rows (the 2026-09-21 empty-MoeWalls regression) ----
+# A bug here silently empties every online video page: the preview lookup
+# indexed the already-built object instead of the row array ("Cannot index
+# object with number") → `[]` for all results. These tests pin the fix.
+th18=$(new_testhome)
+rows18=$(mktemp); out18=$(mktemp)
+printf 'stub-frieren\tvideo\thttps://moewalls.com/p1\tFrieren Snow Live Wallpaper\t1\thttps://moewalls.com/p1.webm\n' >"$rows18"
+printf 'stub-other\tvideo\thttps://moewalls.com/p2\tSome Unrelated Sunset\t2\t\n' >>"$rows18"
+printf 'short\tvideo\n' >>"$rows18"
+call "$th18" rank_moe_rows "frieren" "$rows18" "$out18" >/dev/null
+ranked=$(cat "$out18")
+assert_eq "rank_moe_rows: keeps both valid rows, drops the short one" \
+  "2" "$(printf '%s' "$ranked" | jq 'length')"
+assert_eq "rank_moe_rows: exact title match ranks first" \
+  "stub-frieren" "$(printf '%s' "$ranked" | jq -r '.[0].key')"
+assert_eq "rank_moe_rows: strips the Live Wallpaper suffix" \
+  "Frieren Snow" "$(printf '%s' "$ranked" | jq -r '.[0].title')"
+assert_eq "rank_moe_rows: keeps the preview URL" \
+  "https://moewalls.com/p1.webm" "$(printf '%s' "$ranked" | jq -r '.[0].preview')"
+assert_eq "rank_moe_rows: empty preview encodes as null" \
+  "null" "$(printf '%s' "$ranked" | jq -r '.[1].preview')"
+assert_eq "rank_moe_rows: thumb mirrors key" \
+  "stub-other" "$(printf '%s' "$ranked" | jq -r '.[1].thumb')"
+rows_empty=$(mktemp); out_empty=$(mktemp)
+: >"$rows_empty"
+call "$th18" rank_moe_rows "frieren" "$rows_empty" "$out_empty" >/dev/null
+assert_eq "rank_moe_rows: empty rows yield an empty array, not an error" \
+  "0" "$(cat "$out_empty" | jq 'length')"
+rm -f "$rows18" "$out18" "$rows_empty" "$out_empty"
+
+# ---- steam_parse_search (fixture HTML, no network) ----
+th19=$(new_testhome)
+search19=$(mktemp)
+cat >"$search19" <<'SEARCHHTML'
+<a href="https://steamcommunity.com/sharedfiles/filedetails/?id=1122986705" class="tK5agp5sRy8-"><img src="https://images.steamusercontent.com/ugc/780727677601147484/A933C83749D72BFC96FBC1B72A6EBD5EBBF3974B/?ima=fit&amp;impolicy=Letterbox&amp;imcolor=%23000000&amp;imw=288&amp;imh=288&amp;letterbox=true" alt="Cyberpunk Anime Girl &amp; City" loading="lazy" class=""/>
+<a href="https://steamcommunity.com/sharedfiles/filedetails/?id=2048502967" class="tK5agp5sRy8-"><img src="https://images.steamusercontent.com/ugc/2380802761820896233/C66C930AD9AC50487702915BE325DFAC54261328/?ima=fit&amp;impolicy=Letterbox&amp;imcolor=%23000000&amp;imw=288&amp;imh=288&amp;letterbox=true" alt="Neon Drive" loading="lazy" class=""/>
+SEARCHHTML
+parsed19=$(scall "$th19" steam_parse_search "$search19")
+assert_eq "steam_parse_search: extracts both rows" \
+  "2" "$(printf '%s' "$parsed19" | grep -c '')"
+assert_eq "steam_parse_search: id, decoded title, url, decoded thumb" \
+  "1122986705	Cyberpunk Anime Girl & City	https://steamcommunity.com/sharedfiles/filedetails/?id=1122986705	https://images.steamusercontent.com/ugc/780727677601147484/A933C83749D72BFC96FBC1B72A6EBD5EBBF3974B/?ima=fit&impolicy=Letterbox&imcolor=%23000000&imw=288&imh=288&letterbox=true" \
+  "$(printf '%s' "$parsed19" | head -n1)"
+: >"$search19.empty"
+assert_eq "steam_parse_search: empty page yields empty output" \
+  "" "$(scall "$th19" steam_parse_search "$search19.empty")"
+rm -f "$search19" "$search19.empty"
+
+# ---- steam_parse_detail + steam_size_bytes (fixture HTML, no network) ----
+th20=$(new_testhome)
+detail20=$(mktemp)
+cat >"$detail20" <<'DETAILHTML'
+<title>Steam Workshop::Cyberpunk Anime Girl</title>
+<meta property="og:image" content="https://images.steamusercontent.com/ugc/780727677601147484/A933C83749D72BFC96FBC1B72A6EBD5EBBF3974B/?imw=512&amp;&amp;ima=fit&amp;impolicy=Letterbox">
+<div class="detailsStatRight">126.426 MB</div>
+<div data-panel="{&quot;type&quot;:&quot;PanelGroup&quot;}" class="workshopTags"><span class="workshopTagsTitle">Type:&nbsp;</span><a href="https://steamcommunity.com/workshop/browse/?appid=431960">Video</a>
+DETAILHTML
+det20=$(scall "$th20" steam_parse_detail "$detail20")
+assert_eq "steam_parse_detail: title, image, size, type" \
+  "Cyberpunk Anime Girl	https://images.steamusercontent.com/ugc/780727677601147484/A933C83749D72BFC96FBC1B72A6EBD5EBBF3974B/?imw=512&&ima=fit&impolicy=Letterbox	126.426 MB	Video" \
+  "$det20"
+assert_eq "steam_size_bytes: MB to bytes" \
+  "132567269" "$(scall "$th20" steam_size_bytes "126.426 MB")"
+assert_eq "steam_size_bytes: GB to bytes" \
+  "1288490189" "$(scall "$th20" steam_size_bytes "1.2 GB")"
+assert_eq "steam_size_bytes: KB to bytes" \
+  "870400" "$(scall "$th20" steam_size_bytes "850 KB")"
+assert_rc "steam_size_bytes: junk fails" \
+  1 "$(scall_rc "$th20" steam_size_bytes "huge"; echo $?)"
+rm -f "$detail20"
+
+# ---- steam_find_item_dir (fake tree, no network) ----
+th21=$(new_testhome)
+mkdir -p "$th21/Steam/steamapps/workshop/content/431960/1122986705"
+assert_eq "steam_find_item_dir: finds item under HOME/Steam" \
+  "$th21/Steam/steamapps/workshop/content/431960/1122986705" \
+  "$(HOME="$th21" scall "$th21" steam_find_item_dir "1122986705")"
+assert_rc "steam_find_item_dir: missing item fails" \
+  1 "$(HOME="$th21" scall_rc "$th21" steam_find_item_dir "999999999"; echo $?)"
+assert_rc "steam_find_item_dir: hostile id fails" \
+  1 "$(scall_rc "$th21" steam_find_item_dir "../../etc"; echo $?)"
+
+# ---- steam_status without steamcmd (deterministic here) ----
+th22=$(new_testhome)
+assert_eq "steam_status: unconfigured without binary or user" \
+  "false" "$(scall "$th22" steam_status | jq -r .configured)"
+
+# ---- config_set_key steamUser/steamCmd ----
+th23=$(new_testhome)
+echo '{}' >"$th23/.config/omarchy/wallpaper-engine.json"
+call "$th23" config_set_key steamUser "gamer_01" >/dev/null
+assert_eq "config_set_key: steamUser sticks" \
+  "gamer_01" "$(call "$th23" cfg .steamUser "")"
+assert_rc "config_set_key: steamUser with slash rejected" \
+  1 "$(call_rc "$th23" config_set_key steamUser "a/b"; echo $?)"
+assert_rc "config_set_key: steamCmd missing binary rejected" \
+  1 "$(call_rc "$th23" config_set_key steamCmd "/nonexistent/steamcmd"; echo $?)"
+
+# ---- steam_login (fake steamcmd — env/stdin paths, no network) ----
+steam_login_home() {
+  # isolated home with a fake steamcmd wired in via config steamCmd.
+  # Outcome is selected by <$home>/.fake_steam_outcome (default: success).
+  local th
+  th=$(new_testhome)
+  echo '{}' >"$th/.config/omarchy/wallpaper-engine.json"
+  mkdir -p "$th/bin"
+  cat >"$th/bin/steamcmd" <<'FAKE'
+#!/bin/bash
+# fake steamcmd: swallow the piped credentials, replay a canned outcome
+cat >/dev/null 2>&1 || :
+case "$(cat "$HOME/.fake_steam_outcome" 2>/dev/null)" in
+  password)
+    echo "Cached credentials not found."
+    printf 'password: '
+    echo "Logging in user 'test' to Steam Public..."
+    echo "ERROR (Invalid Password)"
+    exit 5 ;;
+  guard)
+    echo "Logging in user 'test'..."
+    echo "FAILED (Two-factor code mismatch)"
+    exit 1 ;;
+esac
+echo "Welcome to Steam!"
+exit 0
+FAKE
+  chmod +x "$th/bin/steamcmd"
+  call "$th" config_set_key steamCmd "$th/bin/steamcmd" >/dev/null
+  printf '%s' "$th"
+}
+
+th24=$(steam_login_home)
+out24=$(scall_env "WE_STEAM_PASS=s3cret WE_STEAM_CODE=12345" "$th24" steam_login "alice") || true
+assert_eq "steam_login: env login returns steamUser" \
+  "alice" "$(printf '%s' "$out24" | jq -r .steamUser 2>/dev/null)"
+assert_eq "steam_login: env login stores steamUser" \
+  "alice" "$(call "$th24" cfg .steamUser "")"
+
+th25=$(steam_login_home)
+echo password >"$th25/.fake_steam_outcome"
+rc25=0; msg25=$(scall_env "WE_STEAM_PASS=nope" "$th25" steam_login "bob" 2>&1 1>/dev/null) || rc25=$?
+assert_rc "steam_login: wrong password fails" 1 "$rc25"
+assert_eq "steam_login: wrong password message" \
+  "wrong Steam password — retry" "$msg25"
+assert_eq "steam_login: failure stores nothing" \
+  "" "$(call "$th25" cfg .steamUser "")"
+
+th26=$(steam_login_home)
+echo guard >"$th26/.fake_steam_outcome"
+rc26=0; msg26=$(scall_env "WE_STEAM_PASS=s3cret" "$th26" steam_login "bob" 2>&1 1>/dev/null) || rc26=$?
+assert_rc "steam_login: missing guard code fails" 1 "$rc26"
+assert_eq "steam_login: guard hint asks for the code" \
+  "Steam Guard code required — check your email/app, then retry with the code (or run steam-login in a terminal)" "$msg26"
+
+th27=$(steam_login_home)
+echo guard >"$th27/.fake_steam_outcome"
+rc27=0; msg27=$(scall_env "WE_STEAM_PASS=s3cret WE_STEAM_CODE=999" "$th27" steam_login "bob" 2>&1 1>/dev/null) || rc27=$?
+assert_rc "steam_login: wrong guard code fails" 1 "$rc27"
+assert_eq "steam_login: rejected code message" \
+  "Steam Guard code rejected — use the latest code from your app/email and retry" "$msg27"
+
+th28=$(steam_login_home)
+rc28=0; out28=$(printf 'pw1\ncode9\n' | scall "$th28" steam_login "carol" 2>/dev/null) || rc28=$?
+assert_rc "steam_login: stdin pipe login succeeds" 0 "$rc28"
+assert_eq "steam_login: stdin pipe stores steamUser" \
+  "carol" "$(call "$th28" cfg .steamUser "")"
+
+th29=$(steam_login_home)
+rc29=0; msg29=$(scall "$th29" steam_login "bad/name" 2>&1 1>/dev/null) || rc29=$?
+assert_rc "steam_login: hostile username rejected" 1 "$rc29"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

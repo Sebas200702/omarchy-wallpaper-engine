@@ -128,6 +128,7 @@ run_curl_tracked() {
 # shellcheck disable=SC1091
 [[ -f "$plugin_dir/providers/wallhaven.sh" ]] && source "$plugin_dir/providers/wallhaven.sh"
 [[ -f "$plugin_dir/providers/moewalls.sh" ]] && source "$plugin_dir/providers/moewalls.sh"
+[[ -f "$plugin_dir/providers/steam.sh" ]] && source "$plugin_dir/providers/steam.sh"
 
 ensure_secure_dir() {
   local dir="$1"
@@ -1016,6 +1017,31 @@ online_search_moewalls() {
   rm -f "$tmp_rows"
 }
 
+online_search_steam() {
+  # Native picker path for Steam Workshop (no per-item detail step: the
+  # search HTML already carries title + thumb per video item).
+  local query="$1" i id title page_url thumb slug stub
+  rm -f "$online_meta"
+  local tmp_rows
+  tmp_rows=$(mktemp) || return 1
+  i=0
+  while IFS=$'\t' read -r id title page_url thumb; do
+    [[ -n $id && -n $page_url && -n $thumb ]] || continue
+    (( i++ )); (( i > ONLINE_PER_PAGE )) && break
+    title=${title//$'\t'/ }
+    slug="stm-$(safe_slug "$id")"
+    stub="$cache_dir/online/${slug}.jpg"
+    if [[ ! -s $stub ]]; then
+      fetch_thumb "$thumb" "$stub" || continue
+    fi
+    printf '%s\t%s\n' "$stub" "$stub" >>"$tmp_rows"
+    printf '%s\tsteam\t%s\t%s\t%s\t\n' "$stub" "$id" "$page_url" "$title" >>"$online_meta"
+  done < <(steam_search "$query" 1)
+  [[ -s $tmp_rows ]] || { rm -f "$tmp_rows"; omarchy-notification-send "No Steam Workshop results" -t 2000; return 1; }
+  open_picker_rows "$tmp_rows" "online"
+  rm -f "$tmp_rows"
+}
+
 # write_attribution_sidecar <downloaded-file> <provider> <source-page-url> <title>
 # Keeps track of where a downloaded wallpaper came from — the artist's
 # original page — next to the file itself, so the Panel can show it (and so
@@ -1034,6 +1060,7 @@ write_attribution_sidecar() {
 online_apply_stub() {
   # online_apply_stub <stub-path> — downloads full file to online dir + applies
   local stub="$1" line provider a b c max_bytes udir online_dir fname dest ext
+  local detail dtype dsize total_b video_title
   [[ -f $online_meta ]] || return 1
   # exact match on field 1 only — grep -F "$stub"$'\t' would also match if
   # $stub ever occurred as a substring later in the line (e.g. inside a
@@ -1073,6 +1100,34 @@ online_apply_stub() {
       omarchy-notification-send "Download failed" -t 2000; return 1
     fi
     write_attribution_sidecar "$dest" "moewalls" "$b" "$c"
+    unset DOWNLOAD_PROGRESS_LABEL
+    finish_download_progress true
+    apply_file "$dest"
+  elif [[ $provider == steam ]]; then
+    # Online meta for steam: a=item id, b=page url, c=title.
+    video_title="$c"; total_b=""
+    fname="stm-$(safe_slug "$(basename "$stub" .jpg)")-${RANDOM}.mp4"
+    dest="$online_dir/$fname"
+    omarchy-notification-send "Checking Steam item…" -t 1500
+    if detail=$(steam_detail "$a" 2>/dev/null); then
+      dtype=$(printf '%s' "$detail" | cut -f4)
+      dsize=$(printf '%s' "$detail" | cut -f3)
+      if [[ -n $dtype && $dtype != Video ]]; then
+        finish_download_progress false "not a video wallpaper"
+        unset DOWNLOAD_PROGRESS_LABEL
+        omarchy-notification-send "Not a video wallpaper (type: $dtype) — scenes need the Wallpaper Engine app" -t 3000
+        return 1
+      fi
+      total_b=$(steam_size_bytes "$dsize" 2>/dev/null) || total_b=""
+    fi
+    omarchy-notification-send "Downloading from Steam…" -t 2500
+    if ! steam_download "$a" "$dest" "$max_bytes" "$total_b"; then
+      finish_download_progress false "download failed"
+      unset DOWNLOAD_PROGRESS_LABEL
+      omarchy-notification-send "Download failed" -t 2000; return 1
+    fi
+    [[ -n $video_title ]] || video_title="$a"
+    write_attribution_sidecar "$dest" "steam" "$b" "$video_title"
     unset DOWNLOAD_PROGRESS_LABEL
     finish_download_progress true
     apply_file "$dest"
@@ -1343,6 +1398,29 @@ emit_search_envelope() {
       page: $page, pageSize: $size, hasMore: $more}'
 }
 
+# rank_moe_rows <query> <rows_tsv> <items_json_out> — ranks grid-search
+# video rows (stub \t kind \t page \t title \t id \t preview) by
+# query-word overlap in the title so exact matches float up, and emits the
+# panel items JSON. Shared by MoeWalls and Steam. Pure jq transform,
+# offline-testable.
+# A bug here silently empties every online video page (2026-09-21: the
+# preview lookup indexed the already-built object instead of the row array
+# → "Cannot index object with number" → `[]` for all 33 results).
+rank_moe_rows() {
+  local query="$1" rows="$2" out="$3"
+  jq -R -s --arg q "$query" '
+    ($q | ascii_downcase | split(" ") | map(select(length > 0))) as $words
+     | [split("\n")[] | select(length > 0) | split("\t")
+      | select(length >= 5) | . as $cols
+      | {key: $cols[0], kind: $cols[1], page: $cols[2],
+         title: ($cols[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
+         thumb: $cols[0],
+         preview: (if $cols[5] == "" or $cols[5] == null then null else $cols[5] end)}
+      | (.title | ascii_downcase) as $tl
+      | . + {score: ([$words[] | select(. as $w | $tl | contains($w))] | length)}]
+     | sort_by(-.score) | map(del(.score))' "$rows" >"$out" || printf '[]\n' >"$out"
+}
+
 grid_search_json() {
   local provider="$1"; shift
   local page_num=1
@@ -1518,25 +1596,76 @@ grid_search_json() {
     done <"$numbered_tmp.done"
     rm -f "$numbered_tmp.done"
     rm -rf "$det_tmp"
+  elif [[ $provider == steam ]]; then
+    # No per-item detail step: the search HTML already carries title +
+    # thumb per video item (Video type pre-filtered server-side). UI pages
+    # window the fixed 30-row site pages, like Wallhaven's API pages.
+    local id title page_url thumb slug stub
+    local site_tmp numbered_tmp dl_tmp workers idx k1 k2 abs_s abs_e rel_s stm_ok
+    read -r k1 k2 abs_s abs_e < <(wh_api_pages "$page_num" "$cap" "$STEAM_PAGE_SIZE")
+    site_tmp=$(mktemp) || { trap - TERM INT; return 1; }
+    numbered_tmp=$(mktemp) || { rm -f "$site_tmp"; trap - TERM INT; return 1; }
+    stm_ok=1
+    if ! steam_search "$query" "$k1" >"$site_tmp" 2>/dev/null; then stm_ok=0; fi
+    if (( k2 != k1 )); then
+      steam_search "$query" "$k2" >>"$site_tmp" 2>/dev/null || true
+    fi
+    if (( stm_ok == 0 )); then
+      rm -f "$site_tmp" "$numbered_tmp"
+      trap - TERM INT; return 1
+    fi
+    # Slice ranks [abs_s..abs_e] out of the concatenated site TSV (relative
+    # to the first fetched site page), then number for rows/meta.
+    rel_s=$(( abs_s - (k1-1)*STEAM_PAGE_SIZE ))
+    idx=0
+    slice_lines "$rel_s" "$cap" <"$site_tmp" \
+    | while IFS=$'\t' read -r id title page_url thumb; do
+        [[ -n $id && -n $page_url && -n $thumb ]] || continue
+        (( idx++ )) || true
+        title=${title//$'\t'/ }
+        printf '%s\t%s\t%s\t%s\t%s\n' "$idx" "$id" "$title" "$page_url" "$thumb"
+      done >"$numbered_tmp"
+    rm -f "$site_tmp"
+    if [[ ! -s $numbered_tmp ]]; then
+      # Valid response, zero matches → empty page (rc 0), same contract.
+      rm -f "$numbered_tmp"
+      printf '[]\n' >"$items_tmp"
+      trap - TERM INT
+      emit_search_envelope "$items_tmp" "$page_num" "$cap" "$total" || printf '[]\n'
+      return 0
+    fi
+    dl_tmp=$(mktemp) || { rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
+    export -f fetch_thumb fetch_thumb_line
+    while IFS=$'\t' read -r idx id title page_url thumb; do
+      # Query-independent thumb name (stm-<id>.jpg): same cache rationale.
+      slug="stm-$(safe_slug "$id")"
+      stub="$cache_dir/online/${slug}.jpg"
+      if [[ ! -s $stub ]]; then
+        printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "" >>"$numbered_tmp.done"
+    done <"$numbered_tmp"
+    rm -f "$numbered_tmp"
+    if [[ -s $dl_tmp ]]; then
+      timeout 60 xargs -a "$dl_tmp" -d '\n' -r -n 1 -P "$workers" bash -c 'fetch_thumb_line "$1"' _ 2>/dev/null || true
+    fi
+    rm -f "$dl_tmp"
+    while IFS=$'\t' read -r idx stub page_url title id token preview; do
+      [[ -s $stub ]] || continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "" >>"$rows"
+      printf '%s\tsteam\t%s\t%s\t%s\t\n' "$stub" "$id" "$page_url" "$title" >>"$online_meta"
+    done <"$numbered_tmp.done"
+    rm -f "$numbered_tmp.done"
   else
     trap - TERM INT
     return 1
   fi
-  if [[ $provider == moewalls ]]; then
-    # Rank by query-word overlap in the title: the provider's own search is
-    # loose (substring over post content), so exact title matches float up
-    # instead of drowning between loosely related posts.
-    jq -R -s --arg q "$query" '
-      ($q | ascii_downcase | split(" ") | map(select(length > 0))) as $words
-       | [split("\n")[] | select(length > 0) | split("\t")
-        | select(length >= 5)
-        | {key: .[0], kind: .[1], page: .[2],
-           title: (.[3] | sub(" - MoeWalls$"; "") | sub(" Live Wallpaper$"; "")),
-           thumb: .[0]}
-        | (.title | ascii_downcase) as $tl
-        | . + {score: ([$words[] | select(. as $w | $tl | contains($w))] | length),
-               preview: (if .[5] == "" or .[5] == null then null else .[5] end)}]
-       | sort_by(-.score) | map(del(.score))' "$rows" >"$items_tmp" || printf '[]\n' >"$items_tmp"
+  if [[ $provider == moewalls || $provider == steam ]]; then
+    # Rank by query-word overlap in the title: video providers' own search
+    # is loose, so exact title matches float up instead of drowning
+    # between loosely related posts.
+    rank_moe_rows "$query" "$rows" "$items_tmp"
   else
     jq -R -s '
       [split("\n")[] | select(length > 0) | split("\t")
@@ -1566,6 +1695,12 @@ config_set_key() {
     imageFit)
       [[ $val == crop || $val == fit || $val == stretch ]] || { echo "imageFit must be crop|fit|stretch" >&2; rm -f "$tmp"; return 1; }
       jq --arg m "$val" '.imageFit = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    steamUser)
+      [[ $val =~ ^[A-Za-z0-9_.-]{2,64}$ ]] || { echo "steamUser must be 2-64 chars of letters/digits/._-" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" '.steamUser = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    steamCmd)
+      [[ -n $val && -x $val && ! -L $val ]] || { echo "steamCmd must be an executable file" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" '.steamCmd = $v' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
@@ -1925,8 +2060,8 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh next|prev|toggle|status
   wallpaper-engine.sh set <file>
   wallpaper-engine.sh interval <min> | enable | disable
-  wallpaper-engine.sh search wallhaven|moewalls <query>
-  wallpaper-engine.sh grid-local [limit] [playlist] | grid-search wallhaven|moewalls [--page=N] <query>
+  wallpaper-engine.sh search wallhaven|moewalls|steam <query>
+  wallpaper-engine.sh grid-local [limit] [playlist] | grid-search wallhaven|moewalls|steam [--page=N] <query>
     # grid-search serves 20-item pages (Wallhaven's fixed 24-item API pages
     # are windowed, nothing skipped) as {"items":[...],"total":n|null,
     # "page":N,"pageSize":20,"hasMore":bool}; rc 1 + no stdout on failure.
@@ -1935,6 +2070,7 @@ Wallpaper Engine — usage:
   wallpaper-engine.sh playlist-add <n> <files...> | playlist-remove <n> <file>
   wallpaper-engine.sh playlist-activate <n|__all__> | playlist-interval <n> <min> | playlist-mode <n> <mode>
   wallpaper-engine.sh delete-file <path> | favorite-toggle <path>
+  wallpaper-engine.sh steam-login <user> | steam-status   # one-time login (terminal or the panel's sign-in form) owning Wallpaper Engine
   wallpaper-engine.sh schedules | schedule-add <HH:MM> <pick> | schedule-remove <HH:MM> [pick]
   wallpaper-engine.sh monitors | monitor-set <output> <file> | monitor-clear <output> | monitor-fit <output> <crop|fit|stretch>
     # per-monitor pins: sticky over rotation, shown with per-output fit mode
@@ -1977,7 +2113,8 @@ case "${1:-}" in
     case "${2:-}" in
       wallhaven) shift 2; online_search_wallhaven "${*:-anime}" ;;
       moewalls|moe|moewalls.com) shift 2; online_search_moewalls "${*:-anime}" ;;
-      *) echo "usage: search wallhaven|moewalls <query>" >&2; exit 1 ;;
+      steam|workshop|sw) shift 2; online_search_steam "${*:-anime}" ;;
+      *) echo "usage: search wallhaven|moewalls|steam <query>" >&2; exit 1 ;;
     esac
     ;;
   online-status)
@@ -2010,9 +2147,12 @@ case "${1:-}" in
     case "${2:-}" in
       wallhaven) shift 2; grid_search_json wallhaven "$@" ;;
       moewalls|moe|moewalls.com) shift 2; grid_search_json moewalls "$@" ;;
-      *) echo "usage: grid-search wallhaven|moewalls [--page=N] <query>" >&2; exit 1 ;;
+      steam|workshop|sw) shift 2; grid_search_json steam "$@" ;;
+      *) echo "usage: grid-search wallhaven|moewalls|steam [--page=N] <query>" >&2; exit 1 ;;
     esac
     ;;
+  steam-login) steam_login "${2:-}" ;;
+  steam-status) steam_status ;;
   apply-key)
     [[ -n ${2:-} ]] || { echo "usage: apply-key <key>" >&2; exit 1; }
     online_apply_stub "$2" && cat "$current_state" ;;
