@@ -273,8 +273,13 @@ cat >"$menu7m" <<JSONC
 }
 JSONC
 call_rc "$th7m" ensure_menu_override
-assert_eq "ensure_menu_override: refreshes its own Background row" \
+assert_eq "ensure_menu_override: refreshes a Background row from the legacy id" \
   "0" "$(grep -c -- '--old' "$menu7m")"
+assert_eq "ensure_menu_override: Background row now points at the current id" \
+  "1" "$(grep -c 'plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh' "$menu7m")"
+call_rc "$th7m" unwire_menu_override
+assert_eq "unwire_menu_override: removes both plugin rows" \
+  "0" "$(grep -c 'wallpaper-engine' "$menu7m")"
 
 # ---- slice_lines ----
 th8=$(new_testhome)

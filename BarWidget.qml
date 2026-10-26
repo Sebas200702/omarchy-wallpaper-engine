@@ -6,9 +6,10 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "sebas.wallpaper-engine"
+  readonly property string pluginId: "io.github.sebas200702.wallhub"
+  moduleName: root.pluginId
 
-  property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
+  property string script: decodeURIComponent(String(Qt.resolvedUrl("wallpaper-engine.sh")).replace(/^file:\/\//, ""))
   property string currentFile: ""
   property bool paused: false
   property int nextInSec: -1
@@ -67,15 +68,15 @@ BarWidget {
     tooltipText: root.tooltip()
     onPressed: function(btn) {
       if (btn === Qt.RightButton) {
-        Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "next"])
+        Quickshell.execDetached(["omarchy-shell", "-q", root.pluginId, "next"])
         Qt.callLater(root.refresh)
       } else if (btn === Qt.MiddleButton) {
-        Quickshell.execDetached(["omarchy-shell", "-q", "sebas.wallpaper-engine", "toggle"])
+        Quickshell.execDetached(["omarchy-shell", "-q", root.pluginId, "toggle"])
         Qt.callLater(root.refresh)
       } else if (root.bar) {
-        root.bar.run("omarchy-shell shell summon sebas.wallpaper-engine '{}'")
+        root.bar.run("omarchy-shell shell summon " + root.pluginId + " '{}'")
       } else {
-        Quickshell.execDetached(["omarchy-shell", "shell", "summon", "sebas.wallpaper-engine", "{}"])
+        Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.pluginId, "{}"])
       }
     }
   }
@@ -102,7 +103,7 @@ BarWidget {
   // frozen by a battery/idle condition and why.
   Process {
     id: playerProc
-    command: ["omarchy-shell", "-q", "sebas.wallpaper-engine", "status"]
+    command: ["omarchy-shell", "-q", root.pluginId, "status"]
     stdout: StdioCollector {
       onStreamFinished: {
         try {

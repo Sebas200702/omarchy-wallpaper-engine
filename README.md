@@ -1,6 +1,6 @@
 # WallHub for Omarchy
 
-Plugin id `sebas.wallpaper-engine` (kept for compatibility; script `wallpaper-engine.sh`).
+Plugin id `io.github.sebas200702.wallhub` (script `wallpaper-engine.sh`).
 
 Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 
@@ -34,7 +34,7 @@ Put files in your theme folder:
 
 Then open **Style → Background** (overridden by this plugin), double-click the
 desktop, or summon the panel gallery (`omarchy-shell shell summon
-sebas.wallpaper-engine`, or click the bar widget) for the full UI: library,
+io.github.sebas200702.wallhub`, or click the bar widget) for the full UI: library,
 playlists, favorites, schedules, online search, and settings.
 
 ### Rotation
@@ -98,13 +98,13 @@ edits them without touching JSON.
 The plugin script is the CLI (symlink it or call by full path):
 
 ```bash
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh next
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh prev
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh toggle
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh status
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh interval 15
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh enable
-~/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh disable
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh next
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh prev
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh toggle
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh status
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh interval 15
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh enable
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh disable
 ```
 
 Playlists, favorites, schedules:
@@ -141,7 +141,7 @@ rotation — is paused.
 
 ### Panel gallery
 
-Summon with the bar widget or `omarchy-shell shell summon sebas.wallpaper-engine`:
+Summon with the bar widget or `omarchy-shell shell summon io.github.sebas200702.wallhub`:
 
 - **Library / Playlists / Favorites** in the sidebar, each a grid of thumbnails.
 - **Monitors** in the sidebar: per-output pins + fit modes + the global default fit.
@@ -192,10 +192,23 @@ functions directly — path validation, slug/name sanitizing, config reads,
 schedule resolution. No network calls, no external dependencies beyond what
 the plugin itself requires.
 
-## Remove
+### Upgrading from `sebas.wallpaper-engine`
+
+Versions before 0.4.0 used the id `sebas.wallpaper-engine`. Settings,
+playlists, favorites, schedules and monitor pins live in
+`~/.config/omarchy/wallpaper-engine.json`, and downloads in your theme's
+`backgrounds/` folder; both survive the switch (only rotation history and
+caches are reset):
 
 ```bash
 omarchy plugin remove sebas.wallpaper-engine
+omarchy plugin add https://github.com/Sebas200702/omarchy-wallpaper-engine.git --enable
+```
+
+## Remove
+
+```bash
+omarchy plugin remove io.github.sebas200702.wallhub
 ```
 
 Removal stops playback, restores last static wallpaper, removes menu override and state/cache.

@@ -10,7 +10,7 @@ import "icons/paths.js" as IconPaths
 
 // WallHub gallery: top bar with menus (playlists, settings), center grid
 // with search feedback, bottom action bar and a full-card preview.
-// Summoned with: omarchy-shell shell summon sebas.wallpaper-engine
+// Summoned with: omarchy-shell shell summon io.github.sebas200702.wallhub
 Item {
   id: root
 
@@ -83,8 +83,8 @@ Item {
   property string previewPath: ""
   property var previewCache: ({})
 
-  readonly property string pluginId: (manifest && manifest.id) || "sebas.wallpaper-engine"
-  readonly property string script: Quickshell.env("HOME") + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
+  readonly property string pluginId: (manifest && manifest.id) || "io.github.sebas200702.wallhub"
+  readonly property string script: decodeURIComponent(String(Qt.resolvedUrl("wallpaper-engine.sh")).replace(/^file:\/\//, ""))
   // AniDev palette (Design System 01 · Color): near-black tonal surfaces,
   // one brand-blue signal. Text pairs follow its contrast audit: body text
   // never sits on brand-600; filled buttons use brand-700, accent text
@@ -303,7 +303,7 @@ Item {
     root.selectedItem = null
   }
 
-  // Headless diagnostic: omarchy-shell shell call sebas.wallpaper-engine debugState '{}'
+  // Headless diagnostic: omarchy-shell shell call io.github.sebas200702.wallhub debugState '{}'
   // panelRev lets us verify from the CLI which revision of this file the
   // running shell actually loaded (bump on every Panel.qml change).
   readonly property string panelRev: "2026-10-26-anidev-redesign"
@@ -341,7 +341,7 @@ Item {
   }
 
   // Headless UI toggles for screenshot checks:
-  // omarchy-shell shell call sebas.wallpaper-engine debugUi '{"layout":"list","details":true}'
+  // omarchy-shell shell call io.github.sebas200702.wallhub debugUi '{"layout":"list","details":true}'
   function debugUi(json) {
     var o = {}
     try { o = JSON.parse(String(json || "{}")) || {} } catch (e) {}
@@ -2096,7 +2096,7 @@ Item {
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
-    WlrLayershell.namespace: "sebas-wallpaper-engine-panel"
+    WlrLayershell.namespace: "wallhub-panel"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
 
