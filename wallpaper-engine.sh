@@ -1764,9 +1764,19 @@ config_set_key() {
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
-    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle|muteVideos)
+    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle|muteVideos|pauseOnFullscreen)
       [[ $val == true || $val == false ]] || { echo "$key must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" --arg k "$key" '.[$k] = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    sceneFps)
+      [[ $val =~ ^[0-9]+$ && $val -ge 5 && $val -le 240 ]] || { echo "sceneFps must be 5-240" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" '.sceneFps = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    fullscreenIgnore)
+      # comma-separated app-class substrings, e.g. "mpv,chromium"
+      [[ -z $val || $val =~ ^[A-Za-z0-9_.-]{1,64}(,[A-Za-z0-9_.-]{1,64}){0,31}$ ]] || { echo "fullscreenIgnore must be comma-separated app classes" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" '.fullscreenIgnore = ($v | split(",") | map(select(length > 0)))' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    lweAssetsDir)
+      [[ -z $val || ( $val == /* && -d $val && $val != *$'\n'* ) ]] || { echo "lweAssetsDir must be an existing absolute directory or empty" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" 'if $v == "" then del(.lweAssetsDir) else .lweAssetsDir = $v end' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     transitionMs)
       [[ $val =~ ^[0-9]+$ && $val -le 4000 ]] || { echo "transitionMs must be 0-4000" >&2; rm -f "$tmp"; return 1; }
       jq --argjson m "$val" '.transitionMs = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;

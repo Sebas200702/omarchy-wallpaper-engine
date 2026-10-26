@@ -725,5 +725,17 @@ assert_eq "fullscreen_outputs_from: special workspace counts" '["HDMI-A-1"]' \
 assert_eq "fullscreen_outputs_from: ignore list matches class substrings" "[]" \
   "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"org.Chromium","initialClass":"chromium","workspace":{"id":2},"fullscreen":2}]' '["chromium"]')"
 
+# ---- config_set_key: scene / fullscreen keys ----
+thc=$(new_testhome)
+call "$thc" config_set_key sceneFps 60 >/dev/null 2>&1
+assert_eq "config_set_key sceneFps: stores a number" "60" "$(call "$thc" cfg .sceneFps "")"
+assert_rc "config_set_key sceneFps: rejects out of range" 1 "$(call_rc "$thc" config_set_key sceneFps 1000; echo $?)"
+call "$thc" config_set_key pauseOnFullscreen false >/dev/null 2>&1
+assert_eq "config_set_key pauseOnFullscreen: stores false" "false" "$(jq -r '.pauseOnFullscreen' "$thc/.config/omarchy/wallpaper-engine.json")"
+call "$thc" config_set_key fullscreenIgnore "mpv,chromium" >/dev/null 2>&1
+assert_eq "config_set_key fullscreenIgnore: splits into a list" '["mpv","chromium"]' "$(jq -c '.fullscreenIgnore' "$thc/.config/omarchy/wallpaper-engine.json")"
+assert_rc "config_set_key fullscreenIgnore: rejects shell metacharacters" 1 "$(call_rc "$thc" config_set_key fullscreenIgnore 'mpv;rm'; echo $?)"
+assert_rc "config_set_key lweAssetsDir: rejects a missing dir" 1 "$(call_rc "$thc" config_set_key lweAssetsDir /nonexistent/assets; echo $?)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

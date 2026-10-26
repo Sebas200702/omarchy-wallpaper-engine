@@ -93,6 +93,46 @@ battery / idle` is the automatic player freeze. Changes to these keys
 take effect live (no restart needed), and the panel's PLAYBACK section
 edits them without touching JSON.
 
+- `pauseOnFullscreen` (default `true`): pause on the output that shows a
+  real fullscreen app (games, players). Maximized windows don't count.
+  `fullscreenIgnore` (list of app-class substrings, e.g. `["mpv"]`) keeps
+  the wallpaper running for those apps.
+
+### Steam Workshop (no login)
+
+The **Workshop** chip in Biblioteca lists every Wallpaper Engine item
+already on disk: subscribed in the Steam client (native, Flatpak or Snap,
+every library in `libraryfolders.vdf`) or downloaded earlier through
+steamcmd. Extra folders go in `workshopDirs`.
+
+- **Videos** work out of the box: applying one hard-links it into
+  `backgrounds/<theme>/workshop/`, so it then rotates, favorites and pins
+  like any wallpaper.
+- **Scenes and web wallpapers** need
+  [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
+  (AUR `linux-wallpaperengine-git`) plus the Wallpaper Engine assets
+  (installed with the app in Steam, or `lweAssetsDir`). WallHub runs it on
+  every unpinned output with your fit mode, `sceneFps` (default 30) and
+  mute setting, freezes it (SIGSTOP) instead of restarting on
+  battery/idle/fullscreen, and retries twice before falling back to the
+  preview image. `lweBinary` overrides the binary path.
+- **Scene properties** (sliders, toggles, options exposed by the scene) are
+  editable from the preview's properties drawer; overrides live in
+  `sceneProperties` and restart the scene live when it is showing.
+
+Rotation only cycles files, so a scene stays until the next rotation step
+or until you apply something else.
+
+### Doctor
+
+```bash
+~/.config/omarchy/plugins/io.github.sebas200702.wallhub/wallpaper-engine.sh doctor
+```
+
+Checks dependencies, config, the running service, library, Workshop
+folders, linux-wallpaperengine + assets, steamcmd and Hyprland (also in
+Ajustes → Diagnóstico).
+
 ### CLI
 
 The plugin script is the CLI (symlink it or call by full path):
@@ -219,6 +259,9 @@ Removal stops playback, restores last static wallpaper, removes menu override an
   output-agnostic (one layer per `Quickshell.screens` entry), but only
   verified on one screen so far — multi-monitor feedback welcome.
 - **No per-playlist schedules** — schedules are global `HH:MM` slots.
+- **Scenes are verified against a stand-in renderer only** (command line,
+  freeze/thaw, properties); real linux-wallpaperengine feedback welcome.
+- Workshop `application` items are not supported.
 
 ## Credits
 

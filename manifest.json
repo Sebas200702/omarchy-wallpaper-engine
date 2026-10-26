@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.sebas200702.wallhub",
   "name": "WallHub",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "sebas",
   "license": "MIT",
-  "description": "WallHub — wallpaper hub: local images+videos with timed shuffle, playlists, favorites, schedules, per-monitor pins, battery/idle-aware playback, and online search (Wallhaven + MoeWalls + Steam Workshop).",
+  "description": "WallHub — wallpaper hub: local images+videos with timed shuffle, playlists, favorites, schedules, per-monitor pins, battery/idle/fullscreen-aware playback, local Steam Workshop library (scenes via linux-wallpaperengine), and online search (Wallhaven + MoeWalls + Steam Workshop).",
   "kinds": [
     "service",
     "bar-widget",

@@ -27,11 +27,16 @@ Item {
   property string kindFilter: "all" // all | video | image | fav
   property string layoutMode: "grid" // grid | list
   property bool previewOpen: false   // full-card preview overlay
+  property bool propsOpen: false     // scene properties drawer inside the preview
+  property var sceneProps: []        // workshop-properties result for propsId
+  property string propsId: ""
+  property bool propsLoading: false
+  property var doctorRows: []        // doctor --json, loaded with the Ajustes menu
   // Top-bar dropdown currently open: "" | "playlists" | "settings".
   // Configuration lives in these menus; there are no side panels.
   property string openMenu: ""
   onOpenMenuChanged: {
-    if (root.openMenu === "settings" && root.opened) root.loadMonitors()
+    if (root.openMenu === "settings" && root.opened) { root.loadMonitors(); root.loadDoctor() }
     if (root.openMenu === "") keyCatcher.forceActiveFocus()
   }
   // Wallhaven filter row starts expanded (discoverable) but collapses to
@@ -136,7 +141,9 @@ Item {
     "x": "spinQuarter", "sliders-horizontal": "nudge", "check": "pop", "search": "wiggle",
     "list": "nudge", "layout-grid": "pop", "square-check": "pop", "maximize": "pop", "crop": "pop",
     "expand": "pop", "scan": "pop", "chevron-down": "drop", "chevron-left": "nudgeBack",
-    "chevron-right": "nudge", "monitor": "pop", "info": "pop", "clock": "spin"
+    "chevron-right": "nudge", "monitor": "pop", "info": "pop", "clock": "spin",
+    "sparkles": "pop", "globe": "spin", "lock": "wiggle", "circle-check": "pop", "circle-x": "wiggle",
+    "triangle-alert": "wiggle", "stethoscope": "wiggle", "gauge": "spinQuarter", "rotate-ccw": "spin"
   })
 
 
@@ -153,6 +160,7 @@ Item {
   function viewTitle() {
     if (root.view.section === "playlist") return root.view.name
     if (root.view.section === "favorites") return "Favorites"
+    if (root.view.section === "workshop") return "Steam Workshop"
     if (root.view.section === "online") {
       if (root.view.provider === "moewalls") return "Live — MoeWalls"
       if (root.view.provider === "steam") return "Live — Steam"
@@ -164,6 +172,7 @@ Item {
   function viewSourceTag() {
     if (root.view.section === "playlist") return "playlist:" + root.view.name
     if (root.view.section === "favorites") return "favorites"
+    if (root.view.section === "workshop") return "workshop"
     if (root.view.section === "online") return "online:" + root.view.provider + ":" + root.query
     return "lib"
   }
@@ -175,6 +184,7 @@ Item {
       var item = root.items[i]
       if (!item) continue
       if (root.kindFilter === "fav") { if (!item.favorite) continue }
+      else if (root.kindFilter === "scene") { if (item.kind !== "scene" && item.kind !== "web") continue }
       else if (root.kindFilter !== "all" && item.kind !== root.kindFilter) continue
       var t = (root.displayName(item) + " " + root.sourceLabel(item)).toLowerCase()
       if (needle === "" || t.indexOf(needle) !== -1) out.push(item)
@@ -188,7 +198,9 @@ Item {
     for (var i = 0; i < root.items.length; i++) {
       var it = root.items[i]
       if (!it) continue
-      if (kind === "fav" ? it.favorite : it.kind === kind) n++
+      if (kind === "fav" ? it.favorite
+          : kind === "scene" ? (it.kind === "scene" || it.kind === "web")
+          : it.kind === kind) n++
     }
     return n
   }
@@ -235,7 +247,8 @@ Item {
 
   function sourceLabel(item) {
     var p = root.providerOf(item)
-    return p === "moewalls" ? "MoeWalls" : p === "steam" ? "Steam" : p === "wallhaven" ? "Wallhaven" : "Local"
+    return p === "moewalls" ? "MoeWalls" : p === "steam" ? "Steam" : p === "wallhaven" ? "Wallhaven"
+      : p === "workshop" ? "Workshop" : "Local"
   }
 
   function pad2(n) { return n < 9 ? "0" + (n + 1) : String(n + 1) }
@@ -258,11 +271,28 @@ Item {
   readonly property bool wideHero: root.centerW >= 1250
   readonly property bool compactBar: root.centerW < 1000
 
+  function kindLabel(item) {
+    if (!item) return ""
+    return item.kind === "video" ? "Animado" : item.kind === "scene" ? "Escena"
+      : item.kind === "web" ? "Web" : item.kind === "other" ? "App" : "Estático"
+  }
+
   function itemMeta(item) {
     if (!item) return ""
-    return (item.kind === "video" ? "Animado" : "Estático") + "   ·   " + root.sourceLabel(item)
+    return root.kindLabel(item) + "   ·   " + root.sourceLabel(item)
       + (root.view.section === "online" ? "   ·   se descarga al aplicar" : "")
+      + (item.playable === false ? "   ·   " + root.blockedReason(item) : "")
   }
+
+  // Why a Workshop item can't be applied (shown on cards and in the bar).
+  function blockedReason(item) {
+    if (!item || item.playable !== false) return ""
+    return item.reason === "needs-lwe" ? "requiere linux-wallpaperengine" : "tipo no soportado"
+  }
+
+  readonly property bool isWorkshop: root.view.section === "workshop"
+  // Actions that only make sense for wallpaper files on disk.
+  readonly property bool fileActions: root.view.section !== "online" && !root.isWorkshop
 
   function isPinnedHere(item) {
     var o = root.primaryOutput()
@@ -272,7 +302,7 @@ Item {
   // Pin / unpin the selected local wallpaper on the primary output.
   function togglePin(item) {
     var o = root.primaryOutput()
-    if (!item || !o || root.view.section === "online") return
+    if (!item || !o || !root.fileActions) return
     if (root.isPinnedHere(item)) root.monitorAction(["monitor-clear", o.name])
     else root.monitorAction(["monitor-set", o.name, item.key])
   }
@@ -280,19 +310,73 @@ Item {
   function openPreview() {
     if (!root.selectedItem) return
     root.openMenu = ""
+    root.propsOpen = false
     root.previewOpen = true
     // Online live results stream their cached preview clip.
     if (root.view.section === "online" && root.selectedItem.preview) root.requestPreview(root.selectedItem.key)
   }
 
+  function doctorStatus(id) {
+    for (var i = 0; i < root.doctorRows.length; i++) if (root.doctorRows[i].id === id) return root.doctorRows[i].status
+    return ""
+  }
+
+  function loadDoctor() {
+    if (!doctorProc.running) doctorProc.running = true
+  }
+
+  function openProps() {
+    if (!root.selectedItem || root.selectedItem.kind !== "scene") return
+    root.propsId = String(root.selectedItem.workshopId)
+    root.sceneProps = []
+    root.propsLoading = true
+    root.propsOpen = true
+    propsProc.command = [root.script, "workshop-properties", root.propsId]
+    propsProc.running = true
+  }
+
+  // Saves one override; the service restarts the scene if it is showing.
+  function setSceneProp(name, value) {
+    if (root.propsId === "" || value === undefined || value === null || String(value) === "") return
+    var v = String(value)
+    var next = []
+    for (var i = 0; i < root.sceneProps.length; i++) {
+      var p = root.sceneProps[i]
+      if (p.name === name) p = Object.assign({}, p, { override: v })
+      next.push(p)
+    }
+    root.sceneProps = next
+    Quickshell.execDetached([root.script, "scene-prop-set", root.propsId, name, v])
+  }
+
+  function resetSceneProps() {
+    if (root.propsId === "") return
+    Quickshell.execDetached([root.script, "scene-prop-reset", root.propsId])
+    var next = []
+    for (var i = 0; i < root.sceneProps.length; i++) next.push(Object.assign({}, root.sceneProps[i], { override: null }))
+    root.sceneProps = next
+  }
+
+  function propValue(p) {
+    return p.override !== null && p.override !== undefined ? String(p.override) : String(p.value === null ? "" : p.value)
+  }
+
+  // "R: 0.14 G: 0.23 B: 0.4 A: 1" → Qt color.
+  function propColor(p) {
+    var m = /R:\s*([0-9.]+)\s*G:\s*([0-9.]+)\s*B:\s*([0-9.]+)/.exec(String(p.color || ""))
+    return m ? Qt.rgba(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), 1) : "transparent"
+  }
+
   // Preview browsing: move the selection and keep the clip in sync.
   function previewStep(d) {
+    root.propsOpen = false
     root.moveSelection(d, 0)
     if (root.view.section === "online" && root.selectedItem && root.selectedItem.preview)
       root.requestPreview(root.selectedItem.key)
   }
 
   function closeOverlays() {
+    if (root.propsOpen) { root.propsOpen = false; return true }
     if (root.previewOpen) { root.previewOpen = false; return true }
     if (root.openMenu !== "") { root.openMenu = ""; return true }
     return false
@@ -475,10 +559,10 @@ Item {
   function runGrid() {
     var s = root.startBusy(root.view.section === "playlist"
       ? "Loading playlist…" : root.view.section === "favorites"
-      ? "Loading favorites…" : "Loading library…")
+      ? "Loading favorites…" : root.isWorkshop ? "Leyendo Steam Workshop…" : "Loading library…")
     var src = root.view.section === "playlist" ? root.view.name
       : root.view.section === "favorites" ? "__favorites__" : ""
-    gridProc.command = [root.script, "grid-local", "150", src]
+    gridProc.command = root.isWorkshop ? [root.script, "workshop-list"] : [root.script, "grid-local", "150", src]
     gridProc.tag = s
     gridProc.wantSource = root.viewSourceTag()
     gridProc.running = true
@@ -654,6 +738,10 @@ Item {
 
   function applySelected() {
     if (!root.selectedItem || root.loading) return
+    if (root.selectedItem.playable === false) {
+      root.errorText = "No se puede aplicar: " + root.blockedReason(root.selectedItem) + " (ver Ajustes → Diagnóstico)"
+      return
+    }
     var online = root.view.section === "online" || root.itemsSource.indexOf("online:") === 0
     var s = root.startBusy(online
       ? "Downloading full quality… (up to a minute for video)"
@@ -663,6 +751,8 @@ Item {
     root.download = ({ active: false, downloaded: 0, total: null, percent: null })
     if (online)
       applyProc.command = [root.script, "apply-key", root.selectedItem.key]
+    else if (root.isWorkshop)
+      applyProc.command = [root.script, "workshop-apply", String(root.selectedItem.workshopId)]
     else
       applyProc.command = [root.script, "set", root.selectedItem.key]
     applyProc.tag = s
@@ -681,7 +771,7 @@ Item {
   // delete on the second. Only offered for on-disk items (never "online"
   // search results, which aren't files yet).
   function requestDelete() {
-    if (!root.selectedItem || root.loading || root.view.section === "online") return
+    if (!root.selectedItem || root.loading || !root.fileActions) return
     var key = root.selectedItem.key
     if (root.confirmDeleteKey === key) {
       confirmDeleteTimer.stop()
@@ -696,7 +786,7 @@ Item {
   }
 
   function toggleFavorite(item) {
-    if (!item || root.loading || root.view.section === "online") return
+    if (!item || root.loading || !root.fileActions) return
     mutate(["favorite-toggle", item.key], "", true)
   }
 
@@ -1045,6 +1135,16 @@ Item {
     root.items = next
   }
 
+  function markCurrentWorkshop(key) {
+    var next = []
+    for (var i = 0; i < root.items.length; i++) {
+      var it = root.items[i]
+      if (it) it.current = (it.key === key)
+      next.push(it)
+    }
+    root.items = next
+  }
+
   function parseItems(text, source) {
     var arr = []
     try { arr = JSON.parse(String(text || "[]")) || [] } catch (e) { arr = [] }
@@ -1315,6 +1415,42 @@ Item {
       enabled: menuToggle.enabled
       cursorShape: Qt.PointingHandCursor
       onClicked: menuToggle.toggled()
+    }
+  }
+
+  // Minimal drag slider for scene properties; emits committed(value) on
+  // release so a drag doesn't rewrite the config on every pixel.
+  component ValueSlider: Item {
+    id: vslider
+    property real from: 0
+    property real to: 1
+    property real stepSize: 0.1
+    property real value: 0
+    signal committed(real value)
+    implicitHeight: 28
+    readonly property real ratio: vslider.to > vslider.from ? (vslider.value - vslider.from) / (vslider.to - vslider.from) : 0
+    function valueAt(x) {
+      var r = Math.max(0, Math.min(1, x / Math.max(1, vslider.width)))
+      var v = vslider.from + r * (vslider.to - vslider.from)
+      if (vslider.stepSize > 0) v = Math.round((v - vslider.from) / vslider.stepSize) * vslider.stepSize + vslider.from
+      return Math.max(vslider.from, Math.min(vslider.to, Number(v.toFixed(4))))
+    }
+    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: parent.width; height: 2; color: root.cardBorder }
+    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: parent.width * vslider.ratio; height: 2; color: root.accent }
+    Rectangle {
+      anchors.verticalCenter: parent.verticalCenter
+      x: Math.max(0, Math.min(parent.width - width, parent.width * vslider.ratio - width / 2))
+      width: 12
+      height: 12
+      color: sliderArea.pressed ? root.accentText : root.onScrim
+    }
+    MouseArea {
+      id: sliderArea
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onPressed: function(m) { vslider.value = vslider.valueAt(m.x) }
+      onPositionChanged: function(m) { if (pressed) vslider.value = vslider.valueAt(m.x) }
+      onReleased: vslider.committed(vslider.value)
     }
   }
 
@@ -1782,7 +1918,8 @@ Item {
         root.notice = "Applied: " + applyProc.pendingTitle
         var shadow = root.pinnedOutputsText()
         if (shadow !== "") root.notice += " — " + shadow + " keeps its pinned wallpaper (clear the pin in MONITORS to see this one)"
-        if (applyProc.appliedPath !== "" && root.view.section !== "online")
+        if (root.isWorkshop) root.markCurrentWorkshop(root.selectedKey)
+        else if (applyProc.appliedPath !== "" && root.view.section !== "online")
           root.markCurrentFile(applyProc.appliedPath)
         loadConfigSilent()
       } else {
@@ -2027,6 +2164,31 @@ Item {
     onTriggered: root.pollDownload()
   }
 
+  Process {
+    id: doctorProc
+    command: [root.script, "doctor", "--json"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = []
+        try { d = JSON.parse(String(text || "[]")) } catch (e) { d = [] }
+        root.doctorRows = Array.isArray(d) ? d : []
+      }
+    }
+  }
+
+  Process {
+    id: propsProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        root.propsLoading = false
+        var d = []
+        try { d = JSON.parse(String(text || "[]")) } catch (e) { d = [] }
+        root.sceneProps = Array.isArray(d) ? d : []
+      }
+    }
+    onExited: function(code) { root.propsLoading = false }
+  }
+
   // Hover preview debounce: wait until the cursor settles on a cell.
   Timer {
     id: hoverTimer
@@ -2218,7 +2380,7 @@ Item {
                 Rectangle { Layout.leftMargin: 24; Layout.rightMargin: 10; width: 1; height: 26; color: root.cardBorder }
                 NavButton {
                   label: "BIBLIOTECA"
-                  selected: root.view.section === "lib"
+                  selected: root.view.section === "lib" || root.isWorkshop
                   onClicked: { root.openMenu = ""; root.setView("lib") }
                 }
                 NavButton {
@@ -2571,19 +2733,33 @@ Item {
                       onClicked: root.kindFilter = "video"
                     }
                     Chip {
-                      visible: root.view.section !== "online"
+                      visible: root.view.section !== "online" && !root.isWorkshop
                       label: "Estáticos"
                       count: root.countWhere("image")
                       selected: root.kindFilter === "image"
                       onClicked: root.kindFilter = "image"
                     }
                     Chip {
+                      visible: root.isWorkshop
+                      label: "Escenas"
+                      count: root.countWhere("scene")
+                      selected: root.kindFilter === "scene"
+                      onClicked: root.kindFilter = "scene"
+                    }
+                    Chip {
                       visible: root.view.section !== "online" && root.view.section !== "favorites"
-                        && root.centerW > 1000
+                        && !root.isWorkshop && root.centerW > 1180
                       label: "Favoritos"
                       count: root.countWhere("fav")
                       selected: root.kindFilter === "fav"
                       onClicked: root.kindFilter = "fav"
+                    }
+                    // Local Steam Workshop library (no login needed).
+                    Chip {
+                      visible: root.view.section === "lib" || root.isWorkshop
+                      label: "Workshop"
+                      selected: root.isWorkshop
+                      onClicked: root.setView(root.isWorkshop ? "lib" : "workshop", "", "")
                     }
                     Chip {
                       visible: root.view.section === "online"
@@ -2605,7 +2781,7 @@ Item {
                     }
                     Item { Layout.fillWidth: true; visible: root.wideHero }
                     IconButton {
-                      visible: root.view.section !== "online"
+                      visible: root.fileActions
                       icon: root.icons.select
                       size: 40
                       active: root.selectMode
@@ -3034,6 +3210,7 @@ Item {
                         cache: true
                         smooth: true
                         sourceSize.width: 640
+                        opacity: modelData.playable === false ? 0.45 : 1
                         scale: cellHover.hovered && !cell.listMode ? 1.03 : 1.0
                         Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                       }
@@ -3064,7 +3241,8 @@ Item {
 
                       Rectangle {
                         id: liveBadge
-                        visible: modelData.kind === "video" && !cell.listMode
+                        visible: (modelData.kind === "video" || modelData.kind === "scene" || modelData.kind === "web")
+                          && !cell.listMode
                         anchors.top: parent.top
                         anchors.right: parent.right
                         anchors.margins: 10
@@ -3077,20 +3255,50 @@ Item {
                           spacing: 8
                           AnimIcon {
                             anchors.verticalCenter: parent.verticalCenter
-                            name: root.icons.play
+                            name: modelData.kind === "scene" ? "sparkles" : modelData.kind === "web" ? "globe" : root.icons.play
                             color: root.onScrim
-                            filled: true
+                            filled: modelData.kind === "video"
                             size: 11
+                            hovered: cellHover.hovered
                           }
                           Text {
                             anchors.verticalCenter: parent.verticalCenter
                             textFormat: Text.PlainText
-                            text: "LIVE"
+                            text: modelData.kind === "scene" ? "ESCENA" : modelData.kind === "web" ? "WEB" : "LIVE"
                             color: root.onScrim
                             font.family: root.displayFamily
                             font.pixelSize: 12
                             font.weight: Font.Bold
                             font.letterSpacing: 1.4
+                          }
+                        }
+                      }
+
+                      // Workshop item this machine can't render yet.
+                      Rectangle {
+                        visible: modelData.playable === false && !cell.listMode
+                        anchors.top: parent.top
+                        anchors.left: parent.left
+                        anchors.margins: 10
+                        width: blockedRow.implicitWidth + 16
+                        height: 26
+                        color: Qt.rgba(0.07, 0.07, 0.07, 0.86)
+                        border.width: 1
+                        border.color: "#f4d35e"
+                        Row {
+                          id: blockedRow
+                          anchors.centerIn: parent
+                          spacing: 6
+                          AnimIcon { anchors.verticalCenter: parent.verticalCenter; name: "lock"; size: 12; color: "#f4d35e"; hovered: cellHover.hovered }
+                          Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            textFormat: Text.PlainText
+                            text: modelData.reason === "needs-lwe" ? "REQUIERE LWE" : "NO SOPORTADO"
+                            color: "#f4d35e"
+                            font.family: root.displayFamily
+                            font.pixelSize: 11
+                            font.weight: Font.Bold
+                            font.letterSpacing: 1.2
                           }
                         }
                       }
@@ -3235,7 +3443,7 @@ Item {
 
                       IconButton {
                         id: favBtn
-                        visible: root.view.section !== "online"
+                        visible: root.fileActions
                         anchors.right: parent.right
                         anchors.rightMargin: 4
                         anchors.verticalCenter: parent.verticalCenter
@@ -3460,7 +3668,7 @@ Item {
                   }
                   IconButton {
                     Layout.leftMargin: 8
-                    visible: root.view.section !== "online"
+                    visible: root.fileActions
                     icon: "star"
                     filled: !!(root.selectedItem && root.selectedItem.favorite)
                     size: 56
@@ -3471,7 +3679,7 @@ Item {
                   }
                   IconButton {
                     Layout.leftMargin: 8
-                    visible: root.view.section !== "online" && root.primaryOutput() !== null
+                    visible: root.fileActions && root.primaryOutput() !== null
                     icon: root.isPinnedHere(root.selectedItem) ? "pin-off" : "pin"
                     active: root.isPinnedHere(root.selectedItem)
                     size: 56
@@ -3483,7 +3691,7 @@ Item {
                   }
                   IconButton {
                     Layout.leftMargin: 8
-                    visible: root.view.section !== "online" && root.view.section !== "playlist"
+                    visible: root.fileActions && root.view.section !== "playlist"
                     icon: "trash-2"
                     size: 56
                     readonly property bool armed: root.confirmDeleteKey === (root.selectedItem ? root.selectedItem.key : "")
@@ -3796,6 +4004,55 @@ Item {
             enabled: !root.loading
             onToggled: root.toggleMute()
           }
+          MenuToggle {
+            icon: "maximize"
+            label: "Pausar con apps en pantalla completa"
+            checked: ((root.engine.config || {}).pauseOnFullscreen) !== false
+            enabled: !root.loading
+            onToggled: root.setGlobal("pauseOnFullscreen", checked ? "false" : "true")
+          }
+
+          MenuHeading { text: "ESCENAS (WALLPAPER ENGINE)" }
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+            AnimIcon {
+              name: root.doctorStatus("lwe") === "ok" ? "circle-check" : "triangle-alert"
+              size: 16
+              color: root.doctorStatus("lwe") === "ok" ? "#7fb069" : "#f4d35e"
+            }
+            Text {
+              Layout.fillWidth: true
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              text: root.doctorStatus("lwe") === "ok"
+                ? "linux-wallpaperengine listo — las escenas y fondos web del Workshop se pueden aplicar."
+                : "Instala linux-wallpaperengine (AUR: linux-wallpaperengine-git) para escenas y fondos web. Los videos del Workshop ya funcionan."
+              color: root.onScrimDim
+              font.family: root.fontFamily
+              font.pixelSize: 11
+            }
+          }
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+            AnimIcon { name: "gauge"; size: 18; color: root.onScrimDim; hovered: fpsHover.hovered }
+            HoverHandler { id: fpsHover }
+            Text {
+              textFormat: Text.PlainText
+              text: "FPS de escenas"
+              color: root.onScrim
+              font.family: root.fontFamily
+              font.pixelSize: 12
+              Layout.fillWidth: true
+            }
+            Segmented {
+              options: [{ value: 15, label: "15" }, { value: 30, label: "30" }, { value: 60, label: "60" }]
+              current: parseInt((root.engine.config || {}).sceneFps, 10) || 30
+              enabled: !root.loading
+              onPicked: function(v) { root.setGlobal("sceneFps", v) }
+            }
+          }
 
           MenuHeading { text: "MONITORES" }
           Repeater {
@@ -4018,6 +4275,56 @@ Item {
               onClicked: root.createSchedule()
             }
           }
+
+          MenuHeading { text: "DIAGNÓSTICO" }
+          Repeater {
+            model: root.doctorRows
+            RowLayout {
+              id: docRow
+              required property var modelData
+              Layout.fillWidth: true
+              spacing: 10
+              AnimIcon {
+                name: docRow.modelData.status === "ok" ? "circle-check"
+                  : docRow.modelData.status === "fail" ? "circle-x"
+                  : docRow.modelData.status === "warn" ? "triangle-alert" : "info"
+                size: 15
+                color: docRow.modelData.status === "ok" ? "#7fb069"
+                  : docRow.modelData.status === "fail" ? root.onScrimUrgent
+                  : docRow.modelData.status === "warn" ? "#f4d35e" : root.onScrimFaint
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: docRow.modelData.label
+                color: root.onScrim
+                font.family: root.fontFamily
+                font.pixelSize: 12
+                Layout.preferredWidth: 150
+                elide: Text.ElideRight
+              }
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: docRow.modelData.detail
+                color: root.onScrimFaint
+                font.family: root.fontFamily
+                font.pixelSize: 11
+                elide: Text.ElideMiddle
+              }
+            }
+          }
+          RowLayout {
+            Layout.fillWidth: true
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              text: root.doctorRows.length === 0 ? "Comprobando…" : "También en la terminal: wallpaper-engine.sh doctor"
+              color: root.onScrimFaint
+              font.family: root.fontFamily
+              font.pixelSize: 11
+            }
+            IconButton { icon: "stethoscope"; size: 32; tip: "Volver a comprobar"; onClicked: root.loadDoctor() }
+          }
         }
 
         // ============ PREVIEW ============
@@ -4035,10 +4342,11 @@ Item {
           MouseArea { anchors.fill: parent; hoverEnabled: true; onClicked: {} }
 
           readonly property var item: root.selectedItem
-          readonly property bool localItem: root.view.section !== "online"
+          readonly property bool localItem: root.fileActions
           readonly property string videoSource: {
             var it = previewLayer.item
             if (!it || it.kind !== "video" || !root.previewOpen) return ""
+            if (root.isWorkshop) return it.file ? "file://" + it.file : ""
             if (previewLayer.localItem) return "file://" + it.key
             return root.previewKey === it.key && root.previewPath !== "" ? "file://" + root.previewPath : ""
           }
@@ -4046,6 +4354,7 @@ Item {
           ColumnLayout {
             anchors.fill: parent
             anchors.margins: 28
+            anchors.rightMargin: root.propsOpen ? propsDrawer.width + 28 : 28
             spacing: 18
 
             RowLayout {
@@ -4104,6 +4413,19 @@ Item {
                   }
                   sourceSize.width: 1920
                 }
+                // Scene / web previews ship as GIFs: play them.
+                AnimatedImage {
+                  anchors.fill: parent
+                  fillMode: Image.PreserveAspectCrop
+                  asynchronous: true
+                  visible: previewLayer.videoSource === "" && source !== ""
+                  playing: visible && root.previewOpen
+                  source: {
+                    var it = previewLayer.item
+                    if (!it || !root.previewOpen || !it.thumb) return ""
+                    return /\.gif$/i.test(String(it.thumb)) ? "file://" + it.thumb : ""
+                  }
+                }
                 Loader {
                   anchors.fill: parent
                   active: previewLayer.videoSource !== ""
@@ -4132,7 +4454,7 @@ Item {
                   }
                 }
                 Rectangle {
-                  visible: !!previewLayer.item && previewLayer.item.kind === "video"
+                  visible: !!previewLayer.item && previewLayer.item.kind !== "image"
                   anchors.top: parent.top
                   anchors.right: parent.right
                   anchors.margins: 14
@@ -4142,7 +4464,12 @@ Item {
                   Text {
                     id: stageLive
                     anchors.centerIn: parent
-                    text: previewLayer.videoSource !== "" ? "LIVE" : "LIVE · sin vista previa"
+                    text: {
+                      var it = previewLayer.item
+                      if (it && it.kind === "scene") return it.playable === false ? "ESCENA · requiere linux-wallpaperengine" : "ESCENA"
+                      if (it && it.kind === "web") return it.playable === false ? "WEB · requiere linux-wallpaperengine" : "WEB"
+                      return previewLayer.videoSource !== "" ? "LIVE" : "LIVE · sin vista previa"
+                    }
                     color: root.onScrim
                     font.family: root.displayFamily
                     font.pixelSize: 12
@@ -4180,12 +4507,20 @@ Item {
               Layout.alignment: Qt.AlignHCenter
               spacing: 10
               ActionButton {
-                label: previewLayer.localItem ? "APLICAR" : "DESCARGAR Y APLICAR"
+                label: root.view.section === "online" ? "DESCARGAR Y APLICAR" : "APLICAR"
                 icon: "play"
                 primary: true
                 large: true
-                enabled: !root.loading
+                enabled: !root.loading && !(previewLayer.item && previewLayer.item.playable === false)
                 onClicked: { root.previewOpen = false; root.applySelected() }
+              }
+              IconButton {
+                visible: !!previewLayer.item && previewLayer.item.kind === "scene" && previewLayer.item.playable !== false
+                icon: "sliders-horizontal"
+                active: root.propsOpen
+                size: 56
+                tip: "Propiedades de la escena"
+                onClicked: root.propsOpen ? (root.propsOpen = false) : root.openProps()
               }
               IconButton {
                 visible: previewLayer.localItem
@@ -4226,6 +4561,149 @@ Item {
                   var o = root.primaryOutput()
                   if (o && root.isPinnedHere(previewLayer.item)) root.monitorAction(["monitor-fit", o.name, v])
                   else root.monitorAction(["config-set", "imageFit", v])
+                }
+              }
+            }
+          }
+          // ---- scene properties drawer (linux-wallpaperengine) ----
+          Rectangle {
+            id: propsDrawer
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            width: Math.min(380, parent.width * 0.36)
+            visible: root.propsOpen
+            color: root.raisedBg
+            border.width: 1
+            border.color: root.strongLine
+            MouseArea { anchors.fill: parent; hoverEnabled: true; onClicked: {} }
+            Rectangle { anchors.left: parent.left; width: 2; height: parent.height; color: root.accent }
+
+            ColumnLayout {
+              anchors.fill: parent
+              anchors.margins: 20
+              spacing: 10
+
+              RowLayout {
+                Layout.fillWidth: true
+                MenuHeading { text: "PROPIEDADES"; Layout.topMargin: 0; Layout.fillWidth: true }
+                IconButton { icon: "rotate-ccw"; size: 32; flat: true; tip: "Restablecer"; tipBelow: true; onClicked: root.resetSceneProps() }
+                IconButton { icon: "x"; size: 32; flat: true; tip: "Cerrar"; tipBelow: true; onClicked: root.propsOpen = false }
+              }
+              Text {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                text: root.propsLoading ? "Leyendo propiedades…"
+                  : root.sceneProps.length === 0 ? "Esta escena no expone propiedades."
+                  : "Los cambios se aplican al reiniciar la escena (al momento si está activa)."
+                color: root.onScrimFaint
+                font.family: root.fontFamily
+                font.pixelSize: 11
+              }
+
+              Flickable {
+                id: propsFlick
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                contentWidth: width
+                contentHeight: propsCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                WheelHandler {
+                  onWheel: function(e) {
+                    var maxY = Math.max(0, propsFlick.contentHeight - propsFlick.height)
+                    propsFlick.contentY = Math.max(0, Math.min(maxY, propsFlick.contentY - e.angleDelta.y))
+                    e.accepted = true
+                  }
+                }
+                ColumnLayout {
+                  id: propsCol
+                  width: propsFlick.width
+                  spacing: 8
+
+                  Repeater {
+                    model: root.sceneProps
+                    ColumnLayout {
+                      id: propRow
+                      required property var modelData
+                      readonly property string current: root.propValue(propRow.modelData)
+                      Layout.fillWidth: true
+                      spacing: 4
+
+                      // booleans render as a full toggle row
+                      MenuToggle {
+                        visible: propRow.modelData.type === "boolean"
+                        icon: "sparkles"
+                        label: propRow.modelData.label || propRow.modelData.name
+                        checked: propRow.current === "1" || propRow.current === "true"
+                        onToggled: root.setSceneProp(propRow.modelData.name, checked ? "0" : "1")
+                      }
+
+                      RowLayout {
+                        visible: propRow.modelData.type !== "boolean"
+                        Layout.fillWidth: true
+                        Text {
+                          Layout.fillWidth: true
+                          textFormat: Text.PlainText
+                          text: propRow.modelData.label || propRow.modelData.name
+                          color: root.onScrim
+                          font.family: root.fontFamily
+                          font.pixelSize: 12
+                          elide: Text.ElideRight
+                        }
+                        Text {
+                          visible: propRow.modelData.type === "slider"
+                          textFormat: Text.PlainText
+                          text: propRow.current
+                          color: root.accentText
+                          font.family: root.fontFamily
+                          font.pixelSize: 12
+                        }
+                        Rectangle {
+                          visible: propRow.modelData.type === "color"
+                          width: 22; height: 22
+                          color: root.propColor(propRow.modelData)
+                          border.width: 1
+                          border.color: root.strongLine
+                        }
+                      }
+
+                      ValueSlider {
+                        visible: propRow.modelData.type === "slider"
+                        Layout.fillWidth: true
+                        from: propRow.modelData.min !== null ? propRow.modelData.min : 0
+                        to: propRow.modelData.max !== null ? propRow.modelData.max : 1
+                        stepSize: propRow.modelData.step !== null ? propRow.modelData.step : 0
+                        value: parseFloat(propRow.current) || 0
+                        onCommitted: function(v) { root.setSceneProp(propRow.modelData.name, String(v)) }
+                      }
+
+                      Segmented {
+                        visible: propRow.modelData.type === "combolist" && (propRow.modelData.options || []).length <= 5
+                        options: (propRow.modelData.options || []).map(function(o) { return { value: String(o.value), label: String(o.label) } })
+                        current: propRow.current
+                        onPicked: function(v) { root.setSceneProp(propRow.modelData.name, v) }
+                      }
+                      ActionButton {
+                        // long option lists cycle instead of overflowing
+                        visible: propRow.modelData.type === "combolist" && (propRow.modelData.options || []).length > 5
+                        dense: true
+                        label: {
+                          var opts = propRow.modelData.options || []
+                          for (var i = 0; i < opts.length; i++) if (String(opts[i].value) === propRow.current) return String(opts[i].label)
+                          return propRow.current
+                        }
+                        onClicked: {
+                          var opts = propRow.modelData.options || []
+                          var idx = 0
+                          for (var i = 0; i < opts.length; i++) if (String(opts[i].value) === propRow.current) idx = i
+                          root.setSceneProp(propRow.modelData.name, String(opts[(idx + 1) % opts.length].value))
+                        }
+                      }
+                      Rectangle { Layout.fillWidth: true; Layout.topMargin: 4; height: 1; color: root.hairline }
+                    }
+                  }
                 }
               }
             }
