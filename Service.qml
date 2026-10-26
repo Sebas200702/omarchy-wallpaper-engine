@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import Quickshell.Services.UPower
 import QtQuick
 import QtMultimedia
@@ -44,6 +45,19 @@ Item {
   property int idlePauseSecondsCfg: 120
   property bool muteVideosCfg: true
   property bool systemPaused: false
+
+  // ---- fullscreen pause + Workshop scenes ----
+  // sceneConfig mirrors the scene/fullscreen keys of wallpaper-engine.json
+  // (pauseOnFullscreen, fullscreenIgnore[], sceneFps, lweBinary,
+  // lweAssetsDir, sceneProperties{id: {name: value}}).
+  property var sceneConfig: ({ pauseOnFullscreen: true, fullscreenIgnore: [], sceneFps: 30,
+                               lweBinary: "", lweAssetsDir: "", sceneProperties: {} })
+  property string sceneConfigRaw: ""
+  // Workshop item dir rendered by linux-wallpaperengine ("" = none).
+  property string scenePath: ""
+  property bool sceneFrozen: false
+  property int sceneCrashes: 0
+  property string sceneCommandKey: ""
 
   // ---- per-monitor pins ----
   // .monitors[{output: {file, fit}}] from wallpaper-engine.json: an output
@@ -98,6 +112,115 @@ Item {
 
   function reloadMonitorConfig() {
     if (!monitorConfigProc.running) monitorConfigProc.running = true
+  }
+
+  // Names of outputs showing a real fullscreen client (games, players…),
+  // minus fullscreenIgnore[] app classes. Computed by the engine from
+  // hyprctl (`fullscreen-outputs`), because Hyprland's hasFullscreen and the
+  // toplevel's fullscreen flag are both also true for maximized windows.
+  property var fullscreenOutputs: []
+
+  function refreshFullscreen() {
+    if (!root.sceneConfig.pauseOnFullscreen) {
+      if (root.fullscreenOutputs.length > 0) root.fullscreenOutputs = []
+      return
+    }
+    fullscreenDebounce.restart()
+  }
+
+  function validScenePath(p) {
+    var s = String(p || "")
+    if (s.length === 0 || s.length > maxVideoPathLen || s.charAt(0) !== "/") return false
+    if (s.indexOf("..") !== -1 || s.indexOf("\n") !== -1 || s.indexOf("\t") !== -1) return false
+    return /\/steamapps\/workshop\/content\/431960\/[0-9]{3,20}$/.test(s)
+      || /\/steamapps\/common\/wallpaper_engine\/projects\/defaultprojects\/[A-Za-z0-9_]{1,64}$/.test(s)
+  }
+
+  // Outputs the scene covers: every screen without a per-monitor pin.
+  function sceneScreens() {
+    var names = []
+    try {
+      for (var i = 0; i < Quickshell.screens.length; i++) {
+        var n = Quickshell.screens[i].name
+        if (root.pinnedFile(n) === "") names.push(n)
+      }
+    } catch (e) {}
+    return names
+  }
+
+  function sceneCommand() {
+    if (root.scenePath === "") return []
+    var screens = root.sceneScreens()
+    if (screens.length === 0) return []
+    var cfg = root.sceneConfig
+    var bin = String(cfg.lweBinary || "") !== "" ? String(cfg.lweBinary) : "linux-wallpaperengine"
+    var fps = parseInt(cfg.sceneFps, 10)
+    if (!isFinite(fps) || fps < 5 || fps > 240) fps = 30
+    // Our own fullscreen/battery/idle logic freezes the process instead.
+    var cmd = [bin, "--fps", String(fps), "--no-fullscreen-pause", "--disable-mouse"]
+    if (root.muteVideosCfg) cmd.push("--silent")
+    if (String(cfg.lweAssetsDir || "") !== "") cmd.push("--assets-dir", String(cfg.lweAssetsDir))
+    var id = root.scenePath.split("/").pop()
+    var props = (cfg.sceneProperties || {})[id] || {}
+    for (var k in props) {
+      var v = String(props[k])
+      if (/^[A-Za-z0-9_]{1,64}$/.test(k) && /^[A-Za-z0-9_., -]{1,64}$/.test(v)) cmd.push("--set-property", k + "=" + v)
+    }
+    for (var i = 0; i < screens.length; i++) {
+      var fit = root.screenFit(screens[i])
+      cmd.push("--scaling", fit === "fit" ? "fit" : fit === "stretch" ? "stretch" : "fill",
+               "--screen-root", screens[i], "--bg", root.scenePath)
+    }
+    return cmd
+  }
+
+  // (Re)starts linux-wallpaperengine when the effective command changes
+  // (new scene, fps, properties, pins, hotplugged screens).
+  function syncScene() {
+    var cmd = root.sceneCommand()
+    var key = JSON.stringify(cmd)
+    if (key === root.sceneCommandKey && (cmd.length === 0 || sceneProc.running)) return
+    root.sceneCommandKey = key
+    // A stopped (SIGSTOP) process would sit on the SIGTERM forever.
+    if (root.sceneFrozen && sceneProc.running) sceneProc.signal(18)
+    root.sceneFrozen = false
+    if (sceneProc.running) sceneProc.running = false
+    if (cmd.length === 0) return
+    sceneProc.command = cmd
+    sceneStartTimer.restart()
+  }
+
+  function playScene(path) {
+    if (!validScenePath(path)) {
+      console.warn("wallpaper-engine: rejected invalid scene path", path)
+      return
+    }
+    revealTimer.stop()
+    videoPath = ""
+    readyScreens = ({})
+    playGeneration += 1
+    root.sceneCrashes = 0
+    root.scenePath = String(path)
+    root.syncScene()
+  }
+
+  function stopScene() {
+    if (root.scenePath === "" && !sceneProc.running) return
+    root.scenePath = ""
+    root.syncScene()
+  }
+
+  // SIGSTOP/SIGCONT keep the scene's state instead of restarting it.
+  function refreshSceneFreeze() {
+    if (!sceneProc.running) return
+    var screens = root.sceneScreens()
+    var allFull = screens.length > 0
+    for (var i = 0; i < screens.length; i++)
+      if (root.fullscreenOutputs.indexOf(screens[i]) === -1) { allFull = false; break }
+    var freeze = root.systemPaused || allFull
+    if (freeze === root.sceneFrozen) return
+    sceneProc.signal(freeze ? 19 : 18)
+    root.sceneFrozen = freeze
   }
 
   function recomputeSystemPause() {
@@ -162,6 +285,7 @@ Item {
   }
 
   function play(path, transitionMs) {
+    stopScene()
     revealTimer.stop()
     readyScreens = ({})
     var raw = String(path || "").trim()
@@ -185,6 +309,7 @@ Item {
   }
 
   function stop() {
+    stopScene()
     revealTimer.stop()
     revealVideo = false
     videoPath = ""
@@ -362,9 +487,111 @@ Item {
     onTriggered: { root.advanceIfDue(); root.reloadMonitorConfig() }
   }
 
+  Process {
+    id: sceneProc
+    onExited: function(exitCode, exitStatus) {
+      // A deliberate stop clears sceneCommandKey's process; anything else
+      // with a scene still selected is a crash: retry twice, then fall
+      // back to the poster the engine already set as the static background.
+      if (root.scenePath === "" || root.sceneCommandKey !== JSON.stringify(sceneProc.command)) return
+      if (sceneProc.running) return
+      root.sceneFrozen = false
+      if (root.sceneCrashes < 2) {
+        root.sceneCrashes += 1
+        console.warn("wallpaper-engine: linux-wallpaperengine exited", exitCode, "— retry", root.sceneCrashes)
+        sceneStartTimer.interval = 2500
+        sceneStartTimer.restart()
+      } else {
+        console.warn("wallpaper-engine: linux-wallpaperengine keeps failing; showing the poster")
+        Quickshell.execDetached(["omarchy-notification-send", "Scene failed to render — run WallHub doctor", "-t", "4000"])
+        root.scenePath = ""
+        root.sceneCommandKey = ""
+      }
+    }
+  }
+
+  Timer {
+    id: sceneStartTimer
+    interval: 150
+    repeat: false
+    onTriggered: {
+      interval = 150
+      if (root.scenePath !== "" && !sceneProc.running && sceneProc.command.length > 0) {
+        sceneProc.running = true
+        Qt.callLater(root.refreshSceneFreeze)
+      }
+    }
+  }
+
+  onFullscreenOutputsChanged: root.refreshSceneFreeze()
+
+  Timer {
+    id: fullscreenDebounce
+    interval: 250
+    repeat: false
+    onTriggered: if (!fullscreenProc.running) fullscreenProc.running = true
+  }
+
+  Process {
+    id: fullscreenProc
+    command: ["timeout", "8", root.script, "fullscreen-outputs"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = []
+        try { d = JSON.parse(String(text || "[]")) } catch (e) { d = [] }
+        if (!Array.isArray(d)) d = []
+        if (JSON.stringify(d) !== JSON.stringify(root.fullscreenOutputs)) root.fullscreenOutputs = d
+      }
+    }
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      var n = event.name
+      if (n === "fullscreen" || n === "workspace" || n === "workspacev2" || n === "focusedmon"
+          || n === "focusedmonv2" || n === "activespecial" || n === "openwindow" || n === "closewindow"
+          || n === "movewindow" || n === "movewindowv2")
+        root.refreshFullscreen()
+    }
+  }
+  onSystemPausedChanged: root.refreshSceneFreeze()
+
+  Connections {
+    target: Quickshell
+    function onScreensChanged() { root.syncScene() }
+  }
+
+  Process {
+    id: sceneConfigProc
+    command: ["bash", "-c",
+      "jq -c '{pauseOnFullscreen: (.pauseOnFullscreen | if . == null then true else . end), fullscreenIgnore: ([.fullscreenIgnore[]? | strings] | .[0:32]), sceneFps: (.sceneFps // 30), lweBinary: (.lweBinary // \"\"), lweAssetsDir: (.lweAssetsDir // \"\"), sceneProperties: (.sceneProperties // {})}' \"$1\" 2>/dev/null || printf '{}'",
+      "_", root.userConfigPath]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var s = String(text || "").trim()
+        if (s === "" || s === root.sceneConfigRaw) return
+        var d = null
+        try { d = JSON.parse(s) } catch (e) { d = null }
+        if (!d || typeof d !== "object") return
+        root.sceneConfigRaw = s
+        root.sceneConfig = ({
+          pauseOnFullscreen: d.pauseOnFullscreen !== false,
+          fullscreenIgnore: Array.isArray(d.fullscreenIgnore) ? d.fullscreenIgnore : [],
+          sceneFps: d.sceneFps,
+          lweBinary: typeof d.lweBinary === "string" && d.lweBinary.charAt(0) === "/" ? d.lweBinary : "",
+          lweAssetsDir: typeof d.lweAssetsDir === "string" && d.lweAssetsDir.charAt(0) === "/" ? d.lweAssetsDir : "",
+          sceneProperties: (d.sceneProperties && typeof d.sceneProperties === "object") ? d.sceneProperties : {}
+        })
+        root.syncScene()
+        root.refreshFullscreen()
+      }
+    }
+  }
+
   IdleMonitor {
     id: idleMonitor
-    enabled: root.pauseWhenIdleCfg && (root.videoPath !== "" || root.anyPinnedVideo)
+    enabled: root.pauseWhenIdleCfg && (root.videoPath !== "" || root.anyPinnedVideo || root.scenePath !== "")
     timeout: root.idlePauseSecondsCfg
     respectInhibitors: false
     onIsIdleChanged: root.recomputeSystemPause()
@@ -408,7 +635,7 @@ Item {
     path: root.userConfigPath
     watchChanges: true
     printErrors: false
-    onFileChanged: { root.reloadPauseConfig(); root.reloadMonitorConfig() }
+    onFileChanged: { root.reloadPauseConfig(); root.reloadMonitorConfig(); if (!sceneConfigProc.running) sceneConfigProc.running = true }
   }
 
   // Per-monitor pins live in the same JSON file; a tiny dedicated reader
@@ -440,6 +667,7 @@ Item {
         }
         root.anyPinnedVideo = anyVideo
         root.recomputeSystemPause()
+        root.syncScene()
       }
     }
   }
@@ -450,6 +678,7 @@ Item {
     function play(path: string, transitionMs: int): void { root.play(path, transitionMs) }
     function playSimple(path: string): void { root.play(path, 0) }
     function stop(): void { root.stop() }
+    function playScene(path: string): void { root.playScene(path) }
     function next(): void { root.engineNext() }
     function prev(): void { root.enginePrev() }
     function toggle(): void { root.engineToggle() }
@@ -469,7 +698,11 @@ Item {
         muted: root.muteVideosCfg,
         screens: screens,
         monitors: root.monitorConfig.monitors,
-        imageFit: root.monitorConfig.imageFit
+        imageFit: root.monitorConfig.imageFit,
+        scene: root.scenePath,
+        sceneRunning: sceneProc.running,
+        sceneFrozen: root.sceneFrozen,
+        fullscreen: root.fullscreenOutputs
       })
     }
   }
@@ -480,9 +713,15 @@ Item {
     preparePickerProc.running = true
     reloadPauseConfig()
     reloadMonitorConfig()
+    sceneConfigProc.running = true
   }
 
-  Component.onDestruction: Quickshell.execDetached(["bash", "-c", 'p="$1"; [[ ! -L "$p" && -f "$p" && -x "$p" ]] && exec "$p" --cleanup-after-unload', "bash", root.cleanupHelper])
+  Component.onDestruction: {
+    // Quickshell SIGTERMs tracked processes on exit; a frozen scene would
+    // ignore it until continued.
+    if (root.sceneFrozen && sceneProc.running) sceneProc.signal(18)
+    Quickshell.execDetached(["bash", "-c", 'p="$1"; [[ ! -L "$p" && -f "$p" && -x "$p" ]] && exec "$p" --cleanup-after-unload', "bash", root.cleanupHelper])
+  }
 
   Variants {
     model: Quickshell.screens
@@ -541,7 +780,7 @@ Item {
         // Skip the initial decode entirely when already system-paused
         // (e.g. the video changed while the user was idle) — refreshPlayback
         // picks it up the moment the pause lifts.
-        if (!root.systemPaused) player.play()
+        if (!root.systemPaused && !panel.fullscreenHere) player.play()
         Qt.callLater(function() {
           if (panel.playerGeneration === generation && root.playGeneration === generation)
             panel.acceptedGeneration = generation
@@ -553,9 +792,12 @@ Item {
       // lifts, this re-derives the same reveal/frame-ready gating syncPlayer
       // and the frame-ready handler already relied on, rather than forcing
       // playback regardless of where the pre-reveal dance was.
+      readonly property bool fullscreenHere: root.fullscreenOutputs.indexOf(panel.modelData.name) !== -1
+      onFullscreenHereChanged: panel.refreshPlayback()
+
       function refreshPlayback() {
         if (panel.screenVideo === "" || panel.playerGeneration !== root.playGeneration) return
-        if (root.systemPaused) {
+        if (root.systemPaused || panel.fullscreenHere) {
           player.pause()
         } else if (panel.frameDecoded && !root.revealVideo) {
           player.pause()

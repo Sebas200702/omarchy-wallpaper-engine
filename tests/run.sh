@@ -79,6 +79,7 @@ scall() {
     set -- --help
     source "$scriptpath" >/dev/null 2>&1
     source "$provider" >/dev/null 2>&1
+    source "${provider%/*}/workshop.sh" >/dev/null 2>&1
     "$fn" "${args[@]}"
   ' _ "$ENGINE" "$SCRIPT_DIR/providers/steam.sh" "$fn" "$@"
 }
@@ -641,6 +642,129 @@ assert_eq "steam_login: stdin pipe stores steamUser" \
 th29=$(steam_login_home)
 rc29=0; msg29=$(scall "$th29" steam_login "bad/name" 2>&1 1>/dev/null) || rc29=$?
 assert_rc "steam_login: hostile username rejected" 1 "$rc29"
+
+# ---- local Workshop library (providers/workshop.sh) ----
+# Fixture: two Steam libraries (the second only reachable through
+# libraryfolders.vdf), one item of each type, plus a hostile project.json
+# whose "file" tries to escape the item dir.
+wk_home() {
+  local th lib1 lib2
+  th=$(new_testhome)
+  lib1="$th/.local/share/Steam/steamapps/workshop/content/431960"
+  lib2="$th/games/SteamLibrary/steamapps/workshop/content/431960"
+  mkdir -p "$lib1/111111" "$lib1/222222" "$lib2/333333" "$lib2/444444" "$th/.local/share/Steam/steamapps"
+  printf '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' \
+    "$th/.local/share/Steam" "$th/games/SteamLibrary" >"$th/.local/share/Steam/steamapps/libraryfolders.vdf"
+  printf 'fakevideo' >"$lib1/111111/clip one.mp4"; printf 'img' >"$lib1/111111/preview.jpg"
+  printf '{"title":"Video One","type":"Video","file":"clip one.mp4","preview":"preview.jpg"}' >"$lib1/111111/project.json"
+  printf '{"title":"Scene Two","type":"scene","file":"scene.json","preview":"preview.gif"}' >"$lib1/222222/project.json"
+  printf '{"title":"Web Three","type":"web","file":"index.html"}' >"$lib2/333333/project.json"
+  printf '{"title":"Evil","type":"video","file":"../../../../etc/passwd","preview":"../x.jpg"}' >"$lib2/444444/project.json"
+  # Hermetic "renderer missing" regardless of the host's PATH.
+  printf '{"lweBinary":"/nonexistent/linux-wallpaperengine"}' >"$th/.config/omarchy/wallpaper-engine.json"
+  # The app's bundled sample scenes (projects/defaultprojects).
+  local dp="$th/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects"
+  mkdir -p "$dp/beach" "$dp/sheep"
+  printf '{"title":"Beach","type":"scene","file":"scene.json","preview":"preview.jpg"}' >"$dp/beach/project.json"
+  printf '{"title":"Sheep"}' >"$dp/sheep/project.json"
+  printf '%s' "$th"
+}
+thw=$(wk_home)
+wl=$(scall "$thw" workshop_list_json)
+assert_eq "workshop_list_json: finds items across libraryfolders.vdf libraries + bundled scenes" "5" "$(jq 'length' <<<"$wl")"
+assert_eq "workshop_list_json: bundled sample scene listed by folder name" "true scene null" \
+  "$(jq -r '.[] | select(.workshopId=="beach") | "\(.bundled) \(.kind) \(.attribution.sourceUrl)"' <<<"$wl")"
+assert_eq "workshop_list_json: typeless bundled demos are hidden" "0" "$(jq '[.[] | select(.workshopId=="sheep")] | length' <<<"$wl")"
+assert_eq "workshop_item_dir: resolves a bundled scene by name" \
+  "$thw/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach" \
+  "$(scall "$thw" workshop_item_dir beach)"
+assert_eq "workshop_list_json: maps types to kinds" "video,scene,web,video" \
+  "$(jq -r '. as $all | ["111111","222222","333333","444444"] | map(. as $i | $all[] | select(.workshopId == $i) | .kind) | join(",")' <<<"$wl")"
+assert_eq "workshop_list_json: video is playable" "true" "$(jq -r '.[] | select(.workshopId=="111111") | .playable' <<<"$wl")"
+assert_eq "workshop_list_json: scene without linux-wallpaperengine is blocked" "needs-lwe" \
+  "$(jq -r '.[] | select(.workshopId=="222222") | .reason' <<<"$wl")"
+assert_eq "workshop_list_json: hostile file path stays inside the item dir" \
+  "$thw/games/SteamLibrary/steamapps/workshop/content/431960/444444/passwd" \
+  "$(jq -r '.[] | select(.workshopId=="444444") | .file' <<<"$wl")"
+assert_eq "workshop_list_json: hostile preview path stays inside the item dir" \
+  "$thw/games/SteamLibrary/steamapps/workshop/content/431960/444444/x.jpg" \
+  "$(jq -r '.[] | select(.workshopId=="444444") | .thumb' <<<"$wl")"
+assert_rc "workshop_item_dir: rejects a non-numeric id" 1 "$(scall "$thw" workshop_item_dir "../111111" >/dev/null 2>&1; echo $?)"
+lib1w="$thw/.local/share/Steam/steamapps/workshop/content/431960"
+imp=$(scall "$thw" workshop_import_video "$lib1w/111111" "$lib1w/111111/clip one.mp4" 111111 "Video One")
+assert_eq "workshop_import_video: lands in backgrounds/workshop as wk-<id>" \
+  "$thw/.config/omarchy/backgrounds/workshop/wk-111111.mp4" "$imp"
+assert_eq "workshop_import_video: writes a workshop attribution sidecar" "workshop" \
+  "$(jq -r '.provider' "$imp.attribution.json" 2>/dev/null)"
+assert_rc "workshop_import_video: refuses a file outside the item dir" 1 \
+  "$(scall "$thw" workshop_import_video "$lib1w/111111" "/etc/hostname" 111111 "x" >/dev/null 2>&1; echo $?)"
+assert_rc "workshop_is_item_dir: accepts a real item dir" 0 "$(scall "$thw" workshop_is_item_dir "$lib1w/222222"; echo $?)"
+assert_rc "workshop_is_item_dir: rejects a path outside Workshop roots" 1 "$(scall "$thw" workshop_is_item_dir "$thw"; echo $?)"
+
+# ---- linux-wallpaperengine --list-properties parser (README sample) ----
+props_sample=$'barcount - slider\n\tDescription: Bar Count\n\tValue: 64\n\tMinimum value: 16\n\tMaximum value: 64\n\tStep: 1\n\nbloom - boolean\n\tDescription: Bloom\n\tValue: 0\nfrequency - combolist\n\tDescription: Frequency\n\tValue: 2\n\t\tPosible values:\n\t\t16 -> 1\n\t\t32 -> 2\n\t\t64 -> 3\n\nschemecolor - color\n\tDescription: ui_browse_properties_scheme_color\n\tR: 0.14902 G: 0.23137 B: 0.4 A: 1\nvisualizer - boolean\n\tDescription: <hr>Add Visualizer<hr>\n\tValue: 1'
+pj=$(printf '%s\n' "$props_sample" | scall "$(new_testhome)" parse_lwe_properties)
+assert_eq "parse_lwe_properties: one entry per property" "5" "$(jq 'length' <<<"$pj")"
+assert_eq "parse_lwe_properties: slider range" "16 64 1" "$(jq -r '.[0] | "\(.min) \(.max) \(.step)"' <<<"$pj")"
+assert_eq "parse_lwe_properties: combolist options" "32=2" "$(jq -r '.[2].options[1] | "\(.label)=\(.value)"' <<<"$pj")"
+assert_eq "parse_lwe_properties: color components" "R: 0.14902 G: 0.23137 B: 0.4 A: 1" "$(jq -r '.[3].color' <<<"$pj")"
+assert_eq "parse_lwe_properties: strips markup from labels" "Add Visualizer" "$(jq -r '.[4].label' <<<"$pj")"
+# linux-wallpaperengine r627 (what the AUR package actually prints)
+props_real=$'dino - combo\n\tText: Dino\n\tValue: vita\nValues: \n\t\tdoux = Doux\n\t\tvita = Vita\n\nschemecolor - color\n\tText: ui_browse_properties_scheme_color\n\tValue: 0.282353, 0.501961, 0.094118, 1.000000\n\nui_editor_properties_speed - slider\n\tText: ui_editor_properties_speed\n\tMin: -1\n\tMax: 1\n\tStep: 0.1\n\tValue: 0.300000\n'
+pr=$(printf '%s\n' "$props_real" | scall "$(new_testhome)" parse_lwe_properties)
+assert_eq "parse_lwe_properties (r627): combo becomes combolist with value/label" "combolist vita Vita" \
+  "$(jq -r '.[0] | "\(.type) \(.options[1].value) \(.options[1].label)"' <<<"$pr")"
+assert_eq "parse_lwe_properties (r627): comma color becomes a swatch" "R: 0.282353 G: 0.501961 B: 0.094118" "$(jq -r '.[1].color' <<<"$pr")"
+assert_eq "parse_lwe_properties (r627): Min/Max/Step + humanized label" "-1 1 0.1 Speed" \
+  "$(jq -r '.[2] | "\(.min) \(.max) \(.step) \(.label)"' <<<"$pr")"
+
+thp=$(new_testhome)
+assert_rc "scene_prop_set: stores a plain override" 0 "$(scall "$thp" scene_prop_set 222222 bloom 1; echo $?)"
+assert_eq "scene_prop_set: override saved under the item id" "1" "$(jq -r '.sceneProperties["222222"].bloom' "$thp/.config/omarchy/wallpaper-engine.json")"
+assert_rc "scene_prop_set: rejects shell metacharacters" 1 "$(scall "$thp" scene_prop_set 222222 bloom '$(reboot)'; echo $?)"
+assert_rc "scene_prop_set: rejects a hostile property name" 1 "$(scall "$thp" scene_prop_set 222222 'a=b' 1; echo $?)"
+scall "$thp" scene_prop_reset 222222 >/dev/null 2>&1
+assert_eq "scene_prop_reset: drops the item's overrides" "null" "$(jq -r '.sceneProperties["222222"]' "$thp/.config/omarchy/wallpaper-engine.json")"
+
+# ---- doctor ----
+dj=$(scall "$thw" doctor_json 2>/dev/null)
+assert_eq "doctor_json: reports every check with a known status" "true" \
+  "$(jq '(length >= 8) and all(.[]; .status | IN("ok","warn","fail","info"))' <<<"$dj")"
+assert_eq "doctor_json: warns that scenes need linux-wallpaperengine" "warn" "$(jq -r '.[] | select(.id=="lwe") | .status' <<<"$dj")"
+
+# ---- fullscreen_outputs_from (Hyprland: mode 2 = fullscreen, 1 = maximize) ----
+fs_mons='[{"name":"eDP-1","activeWorkspace":{"id":2},"specialWorkspace":{"id":0}},{"name":"HDMI-A-1","activeWorkspace":{"id":5},"specialWorkspace":{"id":-98}}]'
+thf=$(new_testhome)
+assert_eq "fullscreen_outputs_from: maximized windows do not pause" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"foot","workspace":{"id":2},"fullscreen":1}]' '[]')"
+assert_eq "fullscreen_outputs_from: a fullscreen client pauses its output only" '["eDP-1"]' \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"steam_app_1","workspace":{"id":2},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: fullscreen on a hidden workspace is ignored" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"mpv","workspace":{"id":9},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: special workspace counts" '["HDMI-A-1"]' \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"mpv","workspace":{"id":-98},"fullscreen":2}]' '[]')"
+assert_eq "fullscreen_outputs_from: ignore list matches class substrings" "[]" \
+  "$(call "$thf" fullscreen_outputs_from "$fs_mons" '[{"class":"org.Chromium","initialClass":"chromium","workspace":{"id":2},"fullscreen":2}]' '["chromium"]')"
+
+# ---- config_set_key: scene / fullscreen keys ----
+thc=$(new_testhome)
+call "$thc" config_set_key sceneFps 60 >/dev/null 2>&1
+assert_eq "config_set_key sceneFps: stores a number" "60" "$(call "$thc" cfg .sceneFps "")"
+assert_rc "config_set_key sceneFps: rejects out of range" 1 "$(call_rc "$thc" config_set_key sceneFps 1000; echo $?)"
+call "$thc" config_set_key pauseOnFullscreen false >/dev/null 2>&1
+assert_eq "config_set_key pauseOnFullscreen: stores false" "false" "$(jq -r '.pauseOnFullscreen' "$thc/.config/omarchy/wallpaper-engine.json")"
+call "$thc" config_set_key fullscreenIgnore "mpv,chromium" >/dev/null 2>&1
+assert_eq "config_set_key fullscreenIgnore: splits into a list" '["mpv","chromium"]' "$(jq -c '.fullscreenIgnore' "$thc/.config/omarchy/wallpaper-engine.json")"
+assert_rc "config_set_key fullscreenIgnore: rejects shell metacharacters" 1 "$(call_rc "$thc" config_set_key fullscreenIgnore 'mpv;rm'; echo $?)"
+assert_rc "config_set_key lweAssetsDir: rejects a missing dir" 1 "$(call_rc "$thc" config_set_key lweAssetsDir /nonexistent/assets; echo $?)"
+
+# ---- no predictable siblings of mktemp files (shared /tmp) ----
+# Marketplace review 2026-10-26: "$numbered_tmp.done" let another local
+# account pre-create the file and inject rows. Every scratch file must
+# come from mktemp itself, never "<mktemp path>.<suffix>".
+sib=$(grep -nE '"\$\{?[A-Za-z_]*(tmp|rows|list)[A-Za-z_]*\}?\.[A-Za-z]+"' "$ENGINE" "$SCRIPT_DIR"/providers/*.sh \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+assert_eq "no predictable siblings of mktemp scratch files" "" "$sib"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

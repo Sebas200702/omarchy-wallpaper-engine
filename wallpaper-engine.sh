@@ -22,6 +22,8 @@ readonly history_state="$state_dir/history"
 readonly lastchange_state="$state_dir/last-change"
 readonly paused_state="$state_dir/paused"
 readonly current_state="$state_dir/current"
+# Workshop scene/web dir handed to linux-wallpaperengine (providers/workshop.sh).
+readonly scene_state="$state_dir/scene"
 readonly online_meta="$state_dir/online-meta.tsv"
 readonly download_progress="$state_dir/download.progress"
 readonly preview_cache_name="previews"
@@ -137,6 +139,39 @@ run_curl_tracked() {
 [[ -f "$plugin_dir/providers/wallhaven.sh" ]] && source "$plugin_dir/providers/wallhaven.sh"
 [[ -f "$plugin_dir/providers/moewalls.sh" ]] && source "$plugin_dir/providers/moewalls.sh"
 [[ -f "$plugin_dir/providers/steam.sh" ]] && source "$plugin_dir/providers/steam.sh"
+[[ -f "$plugin_dir/providers/workshop.sh" ]] && source "$plugin_dir/providers/workshop.sh"
+
+clear_scene_state() {
+  rm -f "$scene_state"
+}
+
+# fullscreen_outputs_from <monitors_json> <clients_json> <ignore_json> —
+# names of outputs whose visible workspace (regular or special) holds a
+# real fullscreen client (Hyprland mode 2; maximize is mode 1) whose
+# class/initialClass does not contain an ignored substring.
+fullscreen_outputs_from() {
+  jq -cn --argjson mons "$1" --argjson clients "$2" --argjson ignore "$3" '
+    ($ignore | map(ascii_downcase | select(length > 0))) as $ign
+    | [$mons[] | . as $m
+       | select(any($clients[];
+           (.workspace.id == $m.activeWorkspace.id or .workspace.id == ($m.specialWorkspace.id // -99999))
+           and ((.fullscreen // 0) == 2)
+           and ((((.class // "") + " " + (.initialClass // "")) | ascii_downcase) as $c
+                | all($ign[]; ($c | contains(.)) | not))))
+       | .name]'
+}
+
+# fullscreen_outputs — live version for the service (config: pauseOnFullscreen,
+# fullscreenIgnore[]); prints [] when disabled or outside Hyprland.
+fullscreen_outputs() {
+  local mons clients ignore
+  [[ $(cfg '.pauseOnFullscreen' 'true') == false ]] && { echo '[]'; return 0; }
+  mons=$(timeout 3 hyprctl -j monitors 2>/dev/null) || { echo '[]'; return 0; }
+  clients=$(timeout 3 hyprctl -j clients 2>/dev/null) || { echo '[]'; return 0; }
+  ignore=$(jq -c '[.fullscreenIgnore[]? | strings] | .[0:32]' "$user_config" 2>/dev/null) || ignore='[]'
+  [[ -n $ignore ]] || ignore='[]'
+  fullscreen_outputs_from "$mons" "$clients" "$ignore" 2>/dev/null || echo '[]'
+}
 
 ensure_secure_dir() {
   local dir="$1"
@@ -517,7 +552,9 @@ refill_queue() {
   if [[ -s $current_state ]]; then
     local cur
     cur=$(<"$current_state")
-    grep -Fxv "$cur" "$tmp" >"$tmp.new" 2>/dev/null && mv -f "$tmp.new" "$tmp" || true
+    local filtered
+    filtered=$(mktemp) || return 1
+    grep -Fxv "$cur" "$tmp" >"$filtered" 2>/dev/null && mv -f "$filtered" "$tmp" || rm -f "$filtered"
   fi
   head -n "$MAX_ROWS" "$tmp" >"$queue_state"
   chmod 0600 "$queue_state" 2>/dev/null || true
@@ -535,7 +572,7 @@ pop_queue() {
 
 push_history() {
   local f="$1"
-  [[ -n $f ]] || return 0
+  [[ -n $f && -f $f ]] || return 0
   touch "$history_state" 2>/dev/null
   { printf '%s\n' "$f"; cat "$history_state" 2>/dev/null; } | head -n 20 >"$history_state.new"
   mv -f "$history_state.new" "$history_state"
@@ -655,6 +692,7 @@ apply_file() {
   file=$(readlink -f "$file") || return 1
   [[ -s $current_state ]] && prev=$(<"$current_state") || prev=""
   [[ -n $prev && $prev != "$file" ]] && push_history "$prev"
+  clear_scene_state
   if is_video "$file"; then
     poster=$(thumbnail_for_video "$file") || { omarchy-notification-send "Could not read video file" -t 2000; return 1; }
     [[ -L "$state_dir" ]] && return 1
@@ -684,6 +722,7 @@ apply_file() {
 
 restore_static_background() {
   local fallback=""
+  clear_scene_state
   stop_video_ipc
   [[ -L "$fallback_state" ]] && rm -f "$fallback_state" || { [[ -s $fallback_state ]] && fallback=$(<"$fallback_state"); }
   [[ -z $fallback || ! -f $fallback ]] && fallback=$(first_static_background)
@@ -693,6 +732,14 @@ restore_static_background() {
 
 resume_engine() {
   [[ -L "$video_state" || -L "$poster_state" ]] && { rm -f "$video_state" "$poster_state"; return 0; }
+  if [[ -s $scene_state && ! -L $scene_state ]] && declare -F workshop_is_item_dir >/dev/null; then
+    local scene
+    scene=$(<"$scene_state")
+    if workshop_is_item_dir "$scene" && lwe_bin >/dev/null 2>&1; then
+      play_scene_ipc "$scene" && return 0
+    fi
+    clear_scene_state
+  fi
   if [[ -s $video_state && -s $poster_state ]]; then
     local video poster
     video=$(<"$video_state"); poster=$(<"$poster_state")
@@ -731,8 +778,9 @@ stop_if_changed() {
   current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
   expected=$(<"$expected_state")
   [[ -n $current && $current == "$expected" ]] && return 0
-  # manual override → stop video if poster changed, adopt new current, reset timer
+  # manual override → stop video/scene if poster changed, adopt new current, reset timer
   stop_video_ipc
+  clear_scene_state
   rm -f "$video_state" "$poster_state"
   atomic_write "$expected_state" "$current"
   atomic_write "$current_state" "$current"
@@ -905,11 +953,12 @@ do_prev() {
   prev=$(head -n 1 "$history_state")
   tail -n +2 "$history_state" >"$history_state.new" && mv -f "$history_state.new" "$history_state"
   [[ -s $current_state ]] && cur=$(<"$current_state") || cur=""
-  # put current back at queue front
-  if [[ -n $cur ]]; then
+  # put current back at queue front (scene dirs are not queueable)
+  if [[ -n $cur && -f $cur ]]; then
     { printf '%s\n' "$cur"; cat "$queue_state" 2>/dev/null; } >"$queue_state.new" && mv -f "$queue_state.new" "$queue_state"
   fi
   # apply without pushing history again
+  clear_scene_state
   local file="$prev" transition_ms
   transition_ms=$(cfg '.transitionMs' '420')
   validate_wallpaper_path "$file" || return 1
@@ -937,7 +986,12 @@ do_prev() {
 do_status() {
   local cur="" kind="none" active=false paused=false next_in="" queue_len=0 last now interval next_sched="" playlist=""
   [[ -s $current_state ]] && cur=$(<"$current_state")
-  if [[ -n $cur ]]; then is_video "$cur" && kind="video" || kind="image"; active=true; fi
+  if [[ -n $cur ]]; then
+    if [[ -s $scene_state && $(<"$scene_state") == "$cur" ]]; then kind="scene"
+    elif is_video "$cur"; then kind="video"
+    else kind="image"; fi
+    active=true
+  fi
   [[ -f $paused_state && $(<"$paused_state") == 1 ]] && paused=true
   [[ $(cfg '.enabled' 'true') != true ]] && paused=true
   queue_len=0
@@ -1514,7 +1568,7 @@ grid_search_json() {
     rm -f "$kept_tmp"
   elif [[ $provider == moewalls ]]; then
     local id title page_url thumb preview token dtitle slug stub detail
-    local api_tmp numbered_tmp det_tmp dl_tmp workers idx meta_tmp api_ok
+    local api_tmp numbered_tmp det_tmp dl_tmp done_tmp workers idx meta_tmp api_ok
     api_tmp=$(mktemp) || { trap - TERM INT; return 1; }
     numbered_tmp=$(mktemp) || { rm -f "$api_tmp"; trap - TERM INT; return 1; }
     meta_tmp=$(mktemp) || { rm -f "$api_tmp" "$numbered_tmp"; trap - TERM INT; return 1; }
@@ -1553,6 +1607,9 @@ grid_search_json() {
     # Thumbnails for resolved items download in parallel too; items whose
     # thumb is still missing afterwards fall back to a preview-webm frame.
     dl_tmp=$(mktemp) || { rm -rf "$det_tmp"; rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    # Exclusive (mktemp) file, never "$numbered_tmp.done": a predictable
+    # sibling in shared /tmp could be pre-created by another account.
+    done_tmp=$(mktemp) || { rm -rf "$det_tmp"; rm -f "$numbered_tmp" "$dl_tmp"; trap - TERM INT; return 1; }
     export -f fetch_thumb fetch_thumb_line
     while IFS=$'\t' read -r idx id title page_url; do
       [[ -f $det_tmp/$idx ]] || continue
@@ -1579,7 +1636,7 @@ grid_search_json() {
       if [[ ! -s $stub && -n $thumb ]]; then
         printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "$token" "${preview:-}" >>"$numbered_tmp.done"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "$token" "${preview:-}" >>"$done_tmp"
     done <"$numbered_tmp"
     rm -f "$numbered_tmp"
     if [[ -s $dl_tmp ]]; then
@@ -1601,15 +1658,15 @@ grid_search_json() {
       [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "${preview:-}" >>"$rows"
       printf '%s\tmoewalls\t%s\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" "${preview:-}" >>"$online_meta"
-    done <"$numbered_tmp.done"
-    rm -f "$numbered_tmp.done"
+    done <"$done_tmp"
+    rm -f "$done_tmp"
     rm -rf "$det_tmp"
   elif [[ $provider == steam ]]; then
     # No per-item detail step: the search HTML already carries title +
     # thumb per video item (Video type pre-filtered server-side). UI pages
     # window the fixed 30-row site pages, like Wallhaven's API pages.
     local id title page_url thumb slug stub
-    local site_tmp numbered_tmp dl_tmp workers idx k1 k2 abs_s abs_e rel_s stm_ok
+    local site_tmp numbered_tmp dl_tmp done_tmp workers idx k1 k2 abs_s abs_e rel_s stm_ok
     read -r k1 k2 abs_s abs_e < <(wh_api_pages "$page_num" "$cap" "$STEAM_PAGE_SIZE")
     site_tmp=$(mktemp) || { trap - TERM INT; return 1; }
     numbered_tmp=$(mktemp) || { rm -f "$site_tmp"; trap - TERM INT; return 1; }
@@ -1643,6 +1700,7 @@ grid_search_json() {
       return 0
     fi
     dl_tmp=$(mktemp) || { rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    done_tmp=$(mktemp) || { rm -f "$numbered_tmp" "$dl_tmp"; trap - TERM INT; return 1; }
     workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
     export -f fetch_thumb fetch_thumb_line
     while IFS=$'\t' read -r idx id title page_url thumb; do
@@ -1652,7 +1710,7 @@ grid_search_json() {
       if [[ ! -s $stub ]]; then
         printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "" >>"$numbered_tmp.done"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "" >>"$done_tmp"
     done <"$numbered_tmp"
     rm -f "$numbered_tmp"
     if [[ -s $dl_tmp ]]; then
@@ -1663,8 +1721,8 @@ grid_search_json() {
       [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "" >>"$rows"
       printf '%s\tsteam\t%s\t%s\t%s\t\n' "$stub" "$id" "$page_url" "$title" >>"$online_meta"
-    done <"$numbered_tmp.done"
-    rm -f "$numbered_tmp.done"
+    done <"$done_tmp"
+    rm -f "$done_tmp"
   else
     trap - TERM INT
     return 1
@@ -1712,9 +1770,19 @@ config_set_key() {
     enabled)
       [[ $val == true || $val == false ]] || { echo "enabled must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" '.enabled = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
-    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle|muteVideos)
+    includeImages|includeVideos|pauseOnBattery|pauseWhenIdle|muteVideos|pauseOnFullscreen)
       [[ $val == true || $val == false ]] || { echo "$key must be true|false" >&2; rm -f "$tmp"; return 1; }
       jq --argjson b "$val" --arg k "$key" '.[$k] = $b' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    sceneFps)
+      [[ $val =~ ^[0-9]+$ && $val -ge 5 && $val -le 240 ]] || { echo "sceneFps must be 5-240" >&2; rm -f "$tmp"; return 1; }
+      jq --argjson m "$val" '.sceneFps = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    fullscreenIgnore)
+      # comma-separated app-class substrings, e.g. "mpv,chromium"
+      [[ -z $val || $val =~ ^[A-Za-z0-9_.-]{1,64}(,[A-Za-z0-9_.-]{1,64}){0,31}$ ]] || { echo "fullscreenIgnore must be comma-separated app classes" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" '.fullscreenIgnore = ($v | split(",") | map(select(length > 0)))' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
+    lweAssetsDir)
+      [[ -z $val || ( $val == /* && -d $val && $val != *$'\n'* ) ]] || { echo "lweAssetsDir must be an existing absolute directory or empty" >&2; rm -f "$tmp"; return 1; }
+      jq --arg v "$val" 'if $v == "" then del(.lweAssetsDir) else .lweAssetsDir = $v end' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
     transitionMs)
       [[ $val =~ ^[0-9]+$ && $val -le 4000 ]] || { echo "transitionMs must be 0-4000" >&2; rm -f "$tmp"; return 1; }
       jq --argjson m "$val" '.transitionMs = $m' "$user_config" >"$tmp" || { rm -f "$tmp"; return 1; } ;;
@@ -2091,6 +2159,10 @@ WallHub (wallpaper-engine.sh) — usage:
   wallpaper-engine.sh schedules | schedule-add <HH:MM> <pick> | schedule-remove <HH:MM> [pick]
   wallpaper-engine.sh monitors | monitor-set <output> <file> | monitor-clear <output> | monitor-fit <output> <crop|fit|stretch>
     # per-monitor pins: sticky over rotation, shown with per-output fit mode
+  wallpaper-engine.sh workshop-list | workshop-apply <id> | workshop-properties <id>
+  wallpaper-engine.sh scene-prop-set <id> <name> <value> | scene-prop-reset <id>
+    # local Steam Workshop library (no login); scenes/web need linux-wallpaperengine
+  wallpaper-engine.sh doctor [--json]   # environment checks
   wallpaper-engine.sh download-status | preview-fetch <key>
     # live download progress (polled by the panel) + cached hover previews
   wallpaper-engine.sh online-status | online-clear [--all]
@@ -2157,6 +2229,15 @@ case "${1:-}" in
   monitor-fit) monitor_fit "${2:-}" "${3:-}" ;;
   download-status) download_status ;;
   preview-fetch) preview_fetch "${2:-}" ;;
+  workshop-list) workshop_list_json ;;
+  workshop-apply)
+    [[ ${2:-} =~ ^[A-Za-z0-9_]{1,64}$ ]] || { echo "usage: workshop-apply <id>" >&2; exit 1; }
+    workshop_apply "$2" && cat "$current_state" ;;
+  workshop-properties) workshop_properties "${2:-}" ;;
+  scene-prop-set) scene_prop_set "${2:-}" "${3:-}" "${4:-}" ;;
+  scene-prop-reset) scene_prop_reset "${2:-}" ;;
+  doctor) if [[ ${2:-} == --json ]]; then doctor_json; else doctor_text; fi ;;
+  fullscreen-outputs) fullscreen_outputs ;;
   schedules) schedules_json ;;
   schedule-add) schedule_add "${2:-}" "${3:-}" ;;
   schedule-remove) schedule_remove "${2:-}" "${3:-}" ;;
