@@ -250,6 +250,32 @@ printf '{\n  "a": 1\n  "b": 2\n}\n' >"$th7/broken.jsonc"
 assert_rc "validate_jsonc: rejects genuinely invalid JSON (missing comma)" \
   1 "$(call_rc "$th7" validate_jsonc "$th7/broken.jsonc"; echo $?)"
 
+# ---- ensure_menu_override never clobbers a user Background entry ----
+# Marketplace rule: no overwriting user configuration without consent. A
+# customized "style.background" row stays; the plugin's own gallery row is
+# added, and a Background row that already points at the plugin refreshes.
+th7m=$(new_testhome)
+mkdir -p "$th7m/.config/omarchy/extensions"
+cat >"$th7m/.config/omarchy/extensions/omarchy-menu.jsonc" <<'JSONC'
+{
+  "style.background": {"icon":"","label":"My background","action":"my-script"},
+}
+JSONC
+call_rc "$th7m" ensure_menu_override
+menu7m="$th7m/.config/omarchy/extensions/omarchy-menu.jsonc"
+assert_eq "ensure_menu_override: keeps a user-customized Background row" \
+  "1" "$(grep -c '"label":"My background","action":"my-script"' "$menu7m")"
+assert_eq "ensure_menu_override: adds the WallHub gallery row" \
+  "1" "$(grep -c '"style.wallpaper-engine".*"label":"WallHub"' "$menu7m")"
+cat >"$menu7m" <<JSONC
+{
+  "style.background": {"icon":"","label":"Background","action":"$th7m/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh --old"},
+}
+JSONC
+call_rc "$th7m" ensure_menu_override
+assert_eq "ensure_menu_override: refreshes its own Background row" \
+  "0" "$(grep -c -- '--old' "$menu7m")"
+
 # ---- slice_lines ----
 th8=$(new_testhome)
 seq -f 'r%.0f' 1 50 >"$th8/ranks.txt"

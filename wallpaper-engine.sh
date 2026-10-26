@@ -1986,7 +1986,12 @@ ensure_menu_override() {
     fi
     mv -f "$tmp" "$file"
   else
-    menu_upsert_row "$file" "style.background" "$entry" || return 1
+    # Never clobber a user-customized Background entry: only take over the
+    # row when it is absent or already points at this plugin.
+    if ! grep -qE '^[[:space:]]*"style\.background"[[:space:]]*:' "$file" \
+      || grep -qE "^[[:space:]]*\"style\\.background\".*$plugin_id/wallpaper-engine\\.sh" "$file"; then
+      menu_upsert_row "$file" "style.background" "$entry" || return 1
+    fi
     menu_upsert_row "$file" "style.wallpaper-engine" "$gallery" || return 1
   fi
   omarchy menu refresh >/dev/null 2>&1 || true
