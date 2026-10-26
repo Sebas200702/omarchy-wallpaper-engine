@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wallpaper Engine for Omarchy — rotating local images+videos + online search.
+# WallHub for Omarchy (plugin id sebas.wallpaper-engine) — rotating local images+videos + online search.
 # Fork-inspired by tenzin.live-wallpaper (picker/IPC/state patterns reused).
 set -uo pipefail
 
@@ -1971,7 +1971,7 @@ ensure_menu_override() {
   local file="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
   local action="$HOME/.config/omarchy/plugins/$plugin_id/wallpaper-engine.sh"
   local entry="{\"icon\":\"\",\"label\":\"Background\",\"aliases\":[\"background\",\"wallpaper\"],\"action\":\"$action\"}"
-  local gallery="{\"icon\":\"\\uf03e\",\"label\":\"Wallpaper Engine\",\"aliases\":[\"wallpaper engine\",\"wallpapers\"],\"action\":\"omarchy-shell shell summon $plugin_id\"}"
+  local gallery="{\"icon\":\"\\uf03e\",\"label\":\"WallHub\",\"aliases\":[\"wallhub\",\"wallpaper engine\",\"wallpapers\"],\"action\":\"omarchy-shell shell summon $plugin_id\"}"
   mkdir -p "$(dirname "$file")"
   chmod 0700 "$(dirname "$file")" 2>/dev/null || true
   [[ -L "$file" ]] && rm -f "$file"
@@ -2055,7 +2055,7 @@ cleanup_after_unload() {
 
 usage() {
   cat <<'EOF'
-Wallpaper Engine — usage:
+WallHub (wallpaper-engine.sh) — usage:
   wallpaper-engine.sh                  open local picker (images+videos)
   wallpaper-engine.sh next|prev|toggle|status
   wallpaper-engine.sh set <file>

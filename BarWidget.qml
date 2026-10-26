@@ -34,7 +34,7 @@ BarWidget {
   }
 
   function tooltip() {
-    var parts = ["Wallpaper Engine"]
+    var parts = ["WallHub"]
     var n = shortName()
     if (currentFile) parts.push(n + (paused ? " (paused)" : ""))
     if (systemPaused) parts.push("video paused — " + pauseReasonLabel())
@@ -59,8 +59,9 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf03e" // Nerd Font image icon U+F03E (ascii escape)
-    // U+F03E image icon (explicit glyph; Nerd Font in bar font stack)
+    // WallHub: stacked images (Nerd Font md image-multiple U+F02F9,
+    // written as its UTF-16 surrogate pair), matching the panel's mark.
+    text: "\udb80\udef9"
     slotSize: Style.bar.statusSlot
     active: root.paused || root.systemPaused
     tooltipText: root.tooltip()

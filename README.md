@@ -1,4 +1,6 @@
-# Wallpaper Engine for Omarchy
+# WallHub for Omarchy
+
+Plugin id `sebas.wallpaper-engine` (kept for compatibility; script `wallpaper-engine.sh`).
 
 Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 
@@ -9,7 +11,7 @@ Rotating wallpaper engine inspired by `tenzin.live-wallpaper`, extended with:
 - **Playlists + Favorites**: named playlists with their own interval/mode, plus a flat favorites star available from any view
 - **Schedules**: fixed `HH:MM` slots that force a specific file (e.g. night video at 21:00), managed from the CLI or the panel sidebar
 - **Battery/idle-aware playback**: video decoding pauses on battery and after a period of inactivity, resumes instantly
-- **Online search**: Wallhaven (images, official API, filters exposed in the panel) + MoeWalls (live videos, via WP search + direct download) from the same gallery, in 20-item pages with result totals ("showing X of N", "More (X of N)") and per-item attribution. Entering a source starts with an empty search — no default query, results reset on every source switch.
+- **Online search**: Wallhaven (images, official API, filters exposed in the panel) + MoeWalls (live videos) + Steam Workshop (Wallpaper Engine videos, via steamcmd) from the same gallery, in 20-item pages with result totals ("showing X of N", "More (X of N)") and per-item attribution. Entering a source starts with an empty search — no default query, results reset on every source switch.
 - **Panel gallery**: keyboard-navigable grid (arrows + Enter), delete-from-disk with inline confirm, favorite toggle per cell
 - **CLI + bar widget**: `next / prev / toggle / status / interval / search / delete-file / favorite-toggle / schedule-add …`
 
@@ -124,6 +126,7 @@ Online (native picker; the panel's own search UI calls `grid-search`/`apply-key`
 ```bash
 wallpaper-engine.sh search wallhaven "anime sunset"     # browse + pick, downloads to theme folder
 wallpaper-engine.sh search moewalls "frieren"           # browse live videos, pick downloads full mp4
+wallpaper-engine.sh search steam "cyberpunk"            # browse Workshop videos (needs one-time Steam sign-in)
 wallpaper-engine.sh grid-search wallhaven --page=2 "sunset"   # 20-item pages as {items,total,page,pageSize,hasMore}
 wallpaper-engine.sh online-status
 wallpaper-engine.sh online-clear                        # prune download cache
@@ -131,7 +134,7 @@ wallpaper-engine.sh online-clear                        # prune download cache
 
 ### Bar widget
 
-Add **Wallpaper Engine** to the bar: left-click = open the panel gallery, right-click = next wallpaper, middle-click = pause/resume.
+Add **WallHub** to the bar: left-click = open the panel gallery, right-click = next wallpaper, middle-click = pause/resume.
 Tooltip shows current file + time to next rotation + automatic video-freeze
 reason (`video paused — on battery / idle`) when the player — not the
 rotation — is paused.
@@ -160,9 +163,10 @@ Summon with the bar widget or `omarchy-shell shell summon sebas.wallpaper-engine
 
 - **Wallhaven**: official `api/v1/search` (filters configurable — see `wallhaven.*` in the config, or the panel's filter row). Downloads full `path` jpg/png.
 - **MoeWalls**: WP REST `wp/v2/search` for title+URL, then detail HTML parse for `og:image` + `preview.webm` + `data-url` token → full mp4 via `https://go.moewalls.com/download.php?video=<token>` (reverse-engineered from their `custom-wall.js`, verified 2026-09-16). No official API — isolated in `providers/moewalls.sh` so breakage doesn't affect local rotation. Files are personal-use, artists keep rights.
+- **Steam Workshop** (Wallpaper Engine, appid 431960): workshop browse HTML scraped for search (Video type pre-filtered, 30/page, thumbs included — no key, no login for browsing), files downloaded from Valve's CDN via the official `steamcmd` — isolated in `providers/steam.sh`, verified 2026-09-26. Requirements: `steamcmd` installed (AUR `steamcmd`, needs multilib lib32), owning Wallpaper Engine on Steam, and one sign-in — either the panel's **Live — Steam → sign-in form** (user + password + optional Guard code; creds travel via the child's environment, never argv) or the terminal (`wallpaper-engine.sh steam-login <user>`). Steam asks password + Guard code once, then it is remembered; `steam-status` reports the setup. Anonymous downloads are refused by Valve, so unconfigured applies fail with a clear message instead of hanging. **Video wallpapers only**: scenes (`.pkg`, the majority of the Workshop) need the proprietary runtime and are skipped with a clear message — the download promotes the largest playable mp4/webm/mkv/mov. Live progress comes from polling the item dir against the Workshop's stated file size. Workshop items belong to their authors and Valve's ToS applies.
 - Downloads land in `~/.config/omarchy/backgrounds/<theme>/online/` and enter the normal rotation + picker flow, with a `<file>.attribution.json` sidecar recording where they came from. Size-guarded (`maxVideoBytes`, `onlineCacheMaxBytes` LRU prune).
 
-Steam Wallpaper Engine Workshop is out of scope (proprietary format + DRM).
+Workshop **scenes** (`.pkg`, proprietary runtime + DRM) are out of scope — only video wallpapers are downloaded.
 
 ## Files
 
@@ -171,7 +175,7 @@ Steam Wallpaper Engine Workshop is out of scope (proprietary format + DRM).
 - `Panel.qml` — the gallery UI (library/playlists/favorites/online/schedules)
 - `BarWidget.qml` — bar controls
 - `wallpaper-engine.sh` — picker, rotation engine, state, CLI
-- `providers/wallhaven.sh`, `providers/moewalls.sh` — online sources
+- `providers/wallhaven.sh`, `providers/moewalls.sh`, `providers/steam.sh` — online sources
 - `tests/run.sh` — regression tests for the bash helper functions (`bash tests/run.sh`)
 - Runtime state: `~/.local/state/omarchy/wallpaper-engine/`
 - Thumbs/cache: `~/.cache/omarchy/wallpaper-engine/`
@@ -202,3 +206,10 @@ Removal stops playback, restores last static wallpaper, removes menu override an
   output-agnostic (one layer per `Quickshell.screens` entry), but only
   verified on one screen so far — multi-monitor feedback welcome.
 - **No per-playlist schedules** — schedules are global `HH:MM` slots.
+
+## Credits
+
+- Display type: [Kode Mono](https://github.com/isaozler/kode-mono) by
+  Isa Ozler, bundled in `fonts/` under the SIL Open Font License 1.1
+  (`fonts/OFL.txt`). Labels and icons use the system Nerd Font
+  (JetBrainsMono Nerd Font on Omarchy).
