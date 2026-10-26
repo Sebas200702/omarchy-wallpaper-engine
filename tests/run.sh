@@ -758,5 +758,13 @@ assert_eq "config_set_key fullscreenIgnore: splits into a list" '["mpv","chromiu
 assert_rc "config_set_key fullscreenIgnore: rejects shell metacharacters" 1 "$(call_rc "$thc" config_set_key fullscreenIgnore 'mpv;rm'; echo $?)"
 assert_rc "config_set_key lweAssetsDir: rejects a missing dir" 1 "$(call_rc "$thc" config_set_key lweAssetsDir /nonexistent/assets; echo $?)"
 
+# ---- no predictable siblings of mktemp files (shared /tmp) ----
+# Marketplace review 2026-10-26: "$numbered_tmp.done" let another local
+# account pre-create the file and inject rows. Every scratch file must
+# come from mktemp itself, never "<mktemp path>.<suffix>".
+sib=$(grep -nE '"\$\{?[A-Za-z_]*(tmp|rows|list)[A-Za-z_]*\}?\.[A-Za-z]+"' "$ENGINE" "$SCRIPT_DIR"/providers/*.sh \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+assert_eq "no predictable siblings of mktemp scratch files" "" "$sib"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

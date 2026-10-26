@@ -552,7 +552,9 @@ refill_queue() {
   if [[ -s $current_state ]]; then
     local cur
     cur=$(<"$current_state")
-    grep -Fxv "$cur" "$tmp" >"$tmp.new" 2>/dev/null && mv -f "$tmp.new" "$tmp" || true
+    local filtered
+    filtered=$(mktemp) || return 1
+    grep -Fxv "$cur" "$tmp" >"$filtered" 2>/dev/null && mv -f "$filtered" "$tmp" || rm -f "$filtered"
   fi
   head -n "$MAX_ROWS" "$tmp" >"$queue_state"
   chmod 0600 "$queue_state" 2>/dev/null || true
@@ -1566,7 +1568,7 @@ grid_search_json() {
     rm -f "$kept_tmp"
   elif [[ $provider == moewalls ]]; then
     local id title page_url thumb preview token dtitle slug stub detail
-    local api_tmp numbered_tmp det_tmp dl_tmp workers idx meta_tmp api_ok
+    local api_tmp numbered_tmp det_tmp dl_tmp done_tmp workers idx meta_tmp api_ok
     api_tmp=$(mktemp) || { trap - TERM INT; return 1; }
     numbered_tmp=$(mktemp) || { rm -f "$api_tmp"; trap - TERM INT; return 1; }
     meta_tmp=$(mktemp) || { rm -f "$api_tmp" "$numbered_tmp"; trap - TERM INT; return 1; }
@@ -1605,6 +1607,9 @@ grid_search_json() {
     # Thumbnails for resolved items download in parallel too; items whose
     # thumb is still missing afterwards fall back to a preview-webm frame.
     dl_tmp=$(mktemp) || { rm -rf "$det_tmp"; rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    # Exclusive (mktemp) file, never "$numbered_tmp.done": a predictable
+    # sibling in shared /tmp could be pre-created by another account.
+    done_tmp=$(mktemp) || { rm -rf "$det_tmp"; rm -f "$numbered_tmp" "$dl_tmp"; trap - TERM INT; return 1; }
     export -f fetch_thumb fetch_thumb_line
     while IFS=$'\t' read -r idx id title page_url; do
       [[ -f $det_tmp/$idx ]] || continue
@@ -1631,7 +1636,7 @@ grid_search_json() {
       if [[ ! -s $stub && -n $thumb ]]; then
         printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "$token" "${preview:-}" >>"$numbered_tmp.done"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "$token" "${preview:-}" >>"$done_tmp"
     done <"$numbered_tmp"
     rm -f "$numbered_tmp"
     if [[ -s $dl_tmp ]]; then
@@ -1653,15 +1658,15 @@ grid_search_json() {
       [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "${preview:-}" >>"$rows"
       printf '%s\tmoewalls\t%s\t%s\t%s\t%s\n' "$stub" "$token" "$page_url" "$title" "${preview:-}" >>"$online_meta"
-    done <"$numbered_tmp.done"
-    rm -f "$numbered_tmp.done"
+    done <"$done_tmp"
+    rm -f "$done_tmp"
     rm -rf "$det_tmp"
   elif [[ $provider == steam ]]; then
     # No per-item detail step: the search HTML already carries title +
     # thumb per video item (Video type pre-filtered server-side). UI pages
     # window the fixed 30-row site pages, like Wallhaven's API pages.
     local id title page_url thumb slug stub
-    local site_tmp numbered_tmp dl_tmp workers idx k1 k2 abs_s abs_e rel_s stm_ok
+    local site_tmp numbered_tmp dl_tmp done_tmp workers idx k1 k2 abs_s abs_e rel_s stm_ok
     read -r k1 k2 abs_s abs_e < <(wh_api_pages "$page_num" "$cap" "$STEAM_PAGE_SIZE")
     site_tmp=$(mktemp) || { trap - TERM INT; return 1; }
     numbered_tmp=$(mktemp) || { rm -f "$site_tmp"; trap - TERM INT; return 1; }
@@ -1695,6 +1700,7 @@ grid_search_json() {
       return 0
     fi
     dl_tmp=$(mktemp) || { rm -f "$numbered_tmp"; trap - TERM INT; return 1; }
+    done_tmp=$(mktemp) || { rm -f "$numbered_tmp" "$dl_tmp"; trap - TERM INT; return 1; }
     workers=$(nproc 2>/dev/null || echo 4); (( workers > 6 )) && workers=6; (( workers < 1 )) && workers=1
     export -f fetch_thumb fetch_thumb_line
     while IFS=$'\t' read -r idx id title page_url thumb; do
@@ -1704,7 +1710,7 @@ grid_search_json() {
       if [[ ! -s $stub ]]; then
         printf '%s\t%s\n' "$thumb" "$stub" >>"$dl_tmp"
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "" >>"$numbered_tmp.done"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$stub" "$page_url" "$title" "$id" "" >>"$done_tmp"
     done <"$numbered_tmp"
     rm -f "$numbered_tmp"
     if [[ -s $dl_tmp ]]; then
@@ -1715,8 +1721,8 @@ grid_search_json() {
       [[ -s $stub ]] || continue
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stub" "video" "$page_url" "$title" "$id" "" >>"$rows"
       printf '%s\tsteam\t%s\t%s\t%s\t\n' "$stub" "$id" "$page_url" "$title" >>"$online_meta"
-    done <"$numbered_tmp.done"
-    rm -f "$numbered_tmp.done"
+    done <"$done_tmp"
+    rm -f "$done_tmp"
   else
     trap - TERM INT
     return 1
