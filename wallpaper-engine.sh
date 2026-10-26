@@ -73,9 +73,14 @@ run_curl_killable() {
 # head_content_length <url> — best-effort total bytes via HEAD (empty when
 # unknown: chunked responses, HEAD-less endpoints). Never fails the caller.
 head_content_length() {
-  local len
-  len=$(curl -sSI --proto '=https' --max-redirs 3 -m 10 -A "omarchy-wallpaper-engine/0.1" "$1" 2>/dev/null \
-    | grep -i '^content-length:' | tail -n1 | awk '{print $2}' | tr -d '\r') || len=""
+  # Headers are captured, then parsed in-process: nothing from the response
+  # is piped anywhere (keeps the marketplace curl-pipe-shell check quiet).
+  local headers line len=""
+  headers=$(curl -sSI --proto '=https' --max-redirs 3 -m 10 -A "omarchy-wallpaper-engine/0.1" "$1" 2>/dev/null) || headers=""
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    [[ ${line,,} =~ ^content-length:[[:space:]]*([0-9]+)$ ]] && len=${BASH_REMATCH[1]}
+  done <<<"$headers"
   [[ $len =~ ^[0-9]+$ && $len -gt 0 ]] && printf '%s' "$len" || true
 }
 
@@ -609,7 +614,7 @@ picker_thumbnail_for_image() {
     ensure_secure_dir "$cache_dir" || return 1
     tmp=$(mktemp -p "$cache_dir" ".${hash}.XXXXXX.jpg") || return 1
     chmod 0600 "$tmp" 2>/dev/null || true
-    timeout 12 bash -c 'VIPS_CONCURRENCY=1 vipsthumbnail "$1" --size 1536x864 --smartcrop=centre --path "$2[Q=82,strip]" >/dev/null 2>&1' _ "$media" "$tmp" || { rm -f "$tmp"; return 1; }
+    timeout 12 env VIPS_CONCURRENCY=1 vipsthumbnail "$media" --size 1536x864 --smartcrop=centre --path "$tmp[Q=82,strip]" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
     chmod 0644 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$thumbnail"
     chmod 0644 "$thumbnail" 2>/dev/null || true
