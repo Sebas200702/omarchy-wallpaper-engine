@@ -1,9 +1,12 @@
 #!/bin/bash
-# WallHub for Omarchy (plugin id sebas.wallpaper-engine) — rotating local images+videos + online search.
+# WallHub for Omarchy (plugin id io.github.sebas200702.wallhub) — rotating local images+videos + online search.
 # Fork-inspired by tenzin.live-wallpaper (picker/IPC/state patterns reused).
 set -uo pipefail
 
-readonly plugin_id="sebas.wallpaper-engine"
+readonly plugin_id="io.github.sebas200702.wallhub"
+# Pre-marketplace id: its menu rows are still recognized as ours so they
+# are refreshed or removed instead of being treated as user config.
+readonly legacy_plugin_id="sebas.wallpaper-engine"
 readonly plugin_dir="$HOME/.config/omarchy/plugins/$plugin_id"
 readonly state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/wallpaper-engine"
 readonly cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/wallpaper-engine"
@@ -1989,7 +1992,7 @@ ensure_menu_override() {
     # Never clobber a user-customized Background entry: only take over the
     # row when it is absent or already points at this plugin.
     if ! grep -qE '^[[:space:]]*"style\.background"[[:space:]]*:' "$file" \
-      || grep -qE "^[[:space:]]*\"style\\.background\".*$plugin_id/wallpaper-engine\\.sh" "$file"; then
+      || grep -qE "^[[:space:]]*\"style\\.background\".*(${plugin_id//./\\.}|${legacy_plugin_id//./\\.})/wallpaper-engine\\.sh" "$file"; then
       menu_upsert_row "$file" "style.background" "$entry" || return 1
     fi
     menu_upsert_row "$file" "style.wallpaper-engine" "$gallery" || return 1
@@ -2004,8 +2007,12 @@ unwire_menu_override() {
   local tmp
   tmp=$(mktemp -p "$(dirname "$file")" .menu.XXXXXX) || return 1
   cp -f "$file" "$tmp"
-  sed -i -E '\|^[[:space:]]*"style\.background".*sebas\.wallpaper-engine/wallpaper-engine\.sh.*$|d' "$tmp"
-  sed -i -E '\|^[[:space:]]*"style\.wallpaper-engine".*sebas\.wallpaper-engine.*$|d' "$tmp"
+  local id
+  for id in "$plugin_id" "$legacy_plugin_id"; do
+    id=${id//./\\.}
+    sed -i -E "\\|^[[:space:]]*\"style\\.background\".*$id/wallpaper-engine\\.sh.*\$|d" "$tmp"
+    sed -i -E "\\|^[[:space:]]*\"style\\.wallpaper-engine\".*$id.*\$|d" "$tmp"
+  done
   if ! validate_jsonc "$tmp"; then
     echo "wallpaper-engine: refusing to write $file — edit would break JSON (leaving it untouched)" >&2
     rm -f "$tmp"

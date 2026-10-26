@@ -13,7 +13,9 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || home + "/.local/state"
-  readonly property string script: home + "/.config/omarchy/plugins/sebas.wallpaper-engine/wallpaper-engine.sh"
+  // Resolved next to this file, so the plugin works whatever folder it
+  // was installed into.
+  readonly property string script: decodeURIComponent(String(Qt.resolvedUrl("wallpaper-engine.sh")).replace(/^file:\/\//, ""))
   readonly property string cleanupHelper: stateHome + "/omarchy/wallpaper-engine/cleanup"
   property string videoPath: ""
   property var readyScreens: ({})
@@ -443,7 +445,7 @@ Item {
   }
 
   IpcHandler {
-    target: "sebas.wallpaper-engine"
+    target: "io.github.sebas200702.wallhub"
 
     function play(path: string, transitionMs: int): void { root.play(path, transitionMs) }
     function playSimple(path: string): void { root.play(path, 0) }
@@ -567,7 +569,7 @@ Item {
       anchors { top: true; bottom: true; left: true; right: true }
       exclusionMode: ExclusionMode.Ignore
 
-      WlrLayershell.namespace: "sebas-wallpaper-engine"
+      WlrLayershell.namespace: "wallhub"
       // Must be Bottom, not Background: omarchy's static-wallpaper layer
       // (namespace "omarchy-background") also lives on WlrLayer.Background,
       // and Hyprland stacks same-layer surfaces by map order (newest on

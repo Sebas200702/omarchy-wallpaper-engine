@@ -20,7 +20,7 @@ El mismo panel integra búsqueda en Wallhaven, MoeWalls y Steam Workshop con la 
 
 ## Operating Context
 
-Complemento de Omarchy Shell basado en Quickshell y QML. Se abre desde la barra o mediante `omarchy-shell shell summon sebas.wallpaper-engine`. Comparte espacio con el escritorio y opera con teclado y ratón.
+Complemento de Omarchy Shell basado en Quickshell y QML. Se abre desde la barra o mediante `omarchy-shell shell summon io.github.sebas200702.wallhub`. Comparte espacio con el escritorio y opera con teclado y ratón.
 
 ## Capabilities and Constraints
 
