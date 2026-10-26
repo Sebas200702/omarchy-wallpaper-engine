@@ -248,7 +248,7 @@ Item {
   function sourceLabel(item) {
     var p = root.providerOf(item)
     return p === "moewalls" ? "MoeWalls" : p === "steam" ? "Steam" : p === "wallhaven" ? "Wallhaven"
-      : p === "workshop" ? "Workshop" : "Local"
+      : p === "workshop" ? "Workshop" : p === "wallpaper-engine" ? "Wallpaper Engine" : "Local"
   }
 
   function pad2(n) { return n < 9 ? "0" + (n + 1) : String(n + 1) }

@@ -133,6 +133,7 @@ Item {
     if (s.length === 0 || s.length > maxVideoPathLen || s.charAt(0) !== "/") return false
     if (s.indexOf("..") !== -1 || s.indexOf("\n") !== -1 || s.indexOf("\t") !== -1) return false
     return /\/steamapps\/workshop\/content\/431960\/[0-9]{3,20}$/.test(s)
+      || /\/steamapps\/common\/wallpaper_engine\/projects\/defaultprojects\/[A-Za-z0-9_]{1,64}$/.test(s)
   }
 
   // Outputs the scene covers: every screen without a per-monitor pin.

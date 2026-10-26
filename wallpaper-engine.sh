@@ -2225,7 +2225,7 @@ case "${1:-}" in
   preview-fetch) preview_fetch "${2:-}" ;;
   workshop-list) workshop_list_json ;;
   workshop-apply)
-    [[ ${2:-} =~ ^[0-9]{3,20}$ ]] || { echo "usage: workshop-apply <id>" >&2; exit 1; }
+    [[ ${2:-} =~ ^[A-Za-z0-9_]{1,64}$ ]] || { echo "usage: workshop-apply <id>" >&2; exit 1; }
     workshop_apply "$2" && cat "$current_state" ;;
   workshop-properties) workshop_properties "${2:-}" ;;
   scene-prop-set) scene_prop_set "${2:-}" "${3:-}" "${4:-}" ;;

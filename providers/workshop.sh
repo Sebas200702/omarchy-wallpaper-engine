@@ -9,10 +9,14 @@
 # fetched earlier through steamcmd).
 
 WORKSHOP_APPID="431960"
+# Item ids: numeric Workshop ids, or folder names of the sample scenes the
+# Wallpaper Engine app ships in projects/defaultprojects.
+WK_ID_RE='^[A-Za-z0-9_]{1,64}$'
 
-# workshop_roots — one Workshop content dir per line (deduped, canonical):
-# every Steam library listed in each known root's libraryfolders.vdf, plus
-# config .workshopDirs[] for anything unusual.
+# workshop_roots — one item-container dir per line (deduped, canonical):
+# Workshop content and the app's bundled sample scenes, for every Steam
+# library listed in each known root's libraryfolders.vdf, plus config
+# .workshopDirs[] for anything unusual.
 workshop_roots() {
   local roots=(
     "$HOME/.local/share/Steam"
@@ -24,12 +28,14 @@ workshop_roots() {
   {
     for root in "${roots[@]}"; do
       [[ -d $root ]] || continue
-      printf '%s\n' "$root/steamapps/workshop/content/$WORKSHOP_APPID"
+      printf '%s\n' "$root/steamapps/workshop/content/$WORKSHOP_APPID" \
+        "$root/steamapps/common/wallpaper_engine/projects/defaultprojects"
       vdf="$root/steamapps/libraryfolders.vdf"
       [[ -f $vdf && ! -L $vdf ]] || continue
       # "path"		"/mnt/games/SteamLibrary"
       while IFS= read -r lib; do
-        printf '%s\n' "$lib/steamapps/workshop/content/$WORKSHOP_APPID"
+        printf '%s\n' "$lib/steamapps/workshop/content/$WORKSHOP_APPID" \
+          "$lib/steamapps/common/wallpaper_engine/projects/defaultprojects"
       done < <(sed -n -E 's/^[[:space:]]*"path"[[:space:]]+"([^"]+)".*$/\1/p' "$vdf" | head -n 32)
     done
     jq -r '.workshopDirs[]? | strings' "$user_config" 2>/dev/null | head -n 32
@@ -43,7 +49,7 @@ workshop_roots() {
 # workshop_item_dir <id> — content dir of one item, searched across roots.
 workshop_item_dir() {
   local id="$1" root
-  [[ $id =~ ^[0-9]{3,20}$ ]] || return 1
+  [[ $id =~ $WK_ID_RE ]] || return 1
   while IFS= read -r root; do
     [[ -d $root/$id && ! -L $root/$id && -f $root/$id/project.json ]] && { printf '%s' "$root/$id"; return 0; }
   done < <(workshop_roots)
@@ -57,7 +63,7 @@ workshop_is_item_dir() {
   [[ $p == /* && $p != *..* && $p != *$'\n'* ]] || return 1
   [[ -d $p && ! -L $p && -f $p/project.json ]] || return 1
   while IFS= read -r root; do
-    [[ $p == "$root/"* && ${p#"$root/"} =~ ^[0-9]{3,20}$ ]] && return 0
+    [[ $p == "$root/"* && ${p#"$root/"} =~ $WK_ID_RE ]] && return 0
   done < <(workshop_roots)
   return 1
 }
@@ -99,8 +105,11 @@ workshop_item_json() {
         file: (if $file != "" then ($dir + "/" + $file) else null end),
         thumb: (if $preview != "" then ($dir + "/" + $preview) else null end),
         source: "workshop",
-        attribution: {provider: "workshop", title: ((.title // $id) | tostring),
-                      sourceUrl: ("https://steamcommunity.com/sharedfiles/filedetails/?id=" + $id)}
+        bundled: ($id | test("^[0-9]+$") | not),
+        attribution: {provider: (if ($id | test("^[0-9]+$")) then "workshop" else "wallpaper-engine" end),
+                      title: ((.title // $id) | tostring),
+                      sourceUrl: (if ($id | test("^[0-9]+$"))
+                                  then ("https://steamcommunity.com/sharedfiles/filedetails/?id=" + $id) else null end)}
       }
     | .playable = (if .kind == "video" then (.file != null)
                    elif .kind == "scene" or .kind == "web" then $lwe else false end)
@@ -119,11 +128,14 @@ workshop_list_json() {
       for d in "$root"/*/; do
         d=${d%/}
         [[ -d $d && ! -L $d && -f $d/project.json ]] || continue
-        [[ $(basename "$d") =~ ^[0-9]{3,20}$ ]] || continue
+        [[ $(basename "$d") =~ $WK_ID_RE ]] || continue
         workshop_item_json "$d"
       done
     done < <(workshop_roots)
-  } | jq -s 'unique_by(.workshopId) | sort_by(.title | ascii_downcase)'
+  } | jq -s '
+    # Bundled samples without a usable type (audio-only demos) are noise.
+    map(select(.bundled == false or .kind != "other"))
+    | unique_by(.workshopId) | sort_by((if .bundled then 1 else 0 end), (.title | ascii_downcase))'
 }
 
 # workshop_import_video <dir> <file> <id> <title> — hard-links (or copies)
@@ -255,14 +267,14 @@ workshop_properties() {
 # passed as --set-property; values limited to plain numbers/words/colors.
 scene_prop_set() {
   local id="$1" name="$2" value="$3"
-  [[ $id =~ ^[0-9]{3,20}$ && $name =~ ^[A-Za-z0-9_]{1,64}$ ]] || return 1
+  [[ $id =~ $WK_ID_RE && $name =~ ^[A-Za-z0-9_]{1,64}$ ]] || return 1
   [[ $value =~ ^[A-Za-z0-9_.,\ -]{1,64}$ ]] || return 1
   save_config_filtered '.sceneProperties[$id][$n] = $v' --arg id "$id" --arg n "$name" --arg v "$value"
 }
 
 scene_prop_reset() {
   local id="$1"
-  [[ $id =~ ^[0-9]{3,20}$ ]] || return 1
+  [[ $id =~ $WK_ID_RE ]] || return 1
   save_config_filtered 'del(.sceneProperties[$id])' --arg id "$id"
 }
 

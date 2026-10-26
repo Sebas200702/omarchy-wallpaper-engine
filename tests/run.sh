@@ -660,11 +660,24 @@ wk_home() {
   printf '{"title":"Scene Two","type":"scene","file":"scene.json","preview":"preview.gif"}' >"$lib1/222222/project.json"
   printf '{"title":"Web Three","type":"web","file":"index.html"}' >"$lib2/333333/project.json"
   printf '{"title":"Evil","type":"video","file":"../../../../etc/passwd","preview":"../x.jpg"}' >"$lib2/444444/project.json"
+  # Hermetic "renderer missing" regardless of the host's PATH.
+  printf '{"lweBinary":"/nonexistent/linux-wallpaperengine"}' >"$th/.config/omarchy/wallpaper-engine.json"
+  # The app's bundled sample scenes (projects/defaultprojects).
+  local dp="$th/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects"
+  mkdir -p "$dp/beach" "$dp/sheep"
+  printf '{"title":"Beach","type":"scene","file":"scene.json","preview":"preview.jpg"}' >"$dp/beach/project.json"
+  printf '{"title":"Sheep"}' >"$dp/sheep/project.json"
   printf '%s' "$th"
 }
 thw=$(wk_home)
 wl=$(scall "$thw" workshop_list_json)
-assert_eq "workshop_list_json: finds items across libraryfolders.vdf libraries" "4" "$(jq 'length' <<<"$wl")"
+assert_eq "workshop_list_json: finds items across libraryfolders.vdf libraries + bundled scenes" "5" "$(jq 'length' <<<"$wl")"
+assert_eq "workshop_list_json: bundled sample scene listed by folder name" "true scene null" \
+  "$(jq -r '.[] | select(.workshopId=="beach") | "\(.bundled) \(.kind) \(.attribution.sourceUrl)"' <<<"$wl")"
+assert_eq "workshop_list_json: typeless bundled demos are hidden" "0" "$(jq '[.[] | select(.workshopId=="sheep")] | length' <<<"$wl")"
+assert_eq "workshop_item_dir: resolves a bundled scene by name" \
+  "$thw/.local/share/Steam/steamapps/common/wallpaper_engine/projects/defaultprojects/beach" \
+  "$(scall "$thw" workshop_item_dir beach)"
 assert_eq "workshop_list_json: maps types to kinds" "video,scene,web,video" \
   "$(jq -r '. as $all | ["111111","222222","333333","444444"] | map(. as $i | $all[] | select(.workshopId == $i) | .kind) | join(",")' <<<"$wl")"
 assert_eq "workshop_list_json: video is playable" "true" "$(jq -r '.[] | select(.workshopId=="111111") | .playable' <<<"$wl")"
